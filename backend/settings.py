@@ -42,6 +42,12 @@ RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS
 # Max points to scroll for lexical fallback (large values slow every chat request).
 RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
 
+# Strict, non-hallucinating answering mode:
+# - When enabled, responses are assembled from verbatim sentences found in retrieved chunks.
+# - When disabled, the LLM can paraphrase (higher fluency, lower guarantee).
+RAG_STRICT_NO_HALLUCINATE = os.getenv("RAG_STRICT_NO_HALLUCINATE", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "4"))
+
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
 

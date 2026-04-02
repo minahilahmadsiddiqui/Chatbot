@@ -89,24 +89,27 @@ def generate_answer(
         ]
     )
 
+    system_prompt = (
+        "You are an employee handbook assistant.\n"
+        "Answer ONLY from the provided handbook excerpts.\n"
+        "Never invent or infer company policy.\n"
+        f"If the handbook does not explicitly mention the policy, respond with exactly: \"{UNKNOWN_POLICY_PHRASE}\".\n"
+        "Do not answer using loosely related policies.\n"
+        "Prefer exact section wording over paraphrased assumptions.\n"
+        "Quote or cite section titles when possible.\n"
+        "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
+    )
     prompt = (
-        "You are a retrieval-augmented support assistant for employees using an HR policy chatbot.\n"
-        "Use ONLY the information in the Context section below to answer the Question.\n"
-        "Answer ONLY the specific topic asked in the question.\n"
-        "Do not include unrelated policies or extra sections.\n"
-        "If the question is about one policy (for example gym), include only that policy.\n"
-        "If the context does not contain enough information to answer, respond with exactly:\n"
-        f"\"{UNKNOWN_POLICY_PHRASE}\"\n"
-        "Otherwise, format your answer as follows:\n"
-        "1) Be concise but thorough.\n"
-        "2) Do NOT use markdown symbols such as * or **.\n"
-        "3) Use numbered points (1., 2., 3.) for all key items.\n"
-        "4) Put each point on a new line, and leave one blank line between points.\n"
-        "5) For complex queries, break the answer into logical sections with labels ending in ':'.\n"
-        "6) Do not mention chunks or retrieval internals.\n"
-        "7) Do not add unsupported assumptions; stay grounded in provided context.\n\n"
-        f"Question:\n{question}\n\n"
-        f"Context:\n{context_text}\n"
+        "Context (authoritative):\n"
+        f"{context_text}\n\n"
+        "Question:\n"
+        f"{question}\n\n"
+        "Formatting rules:\n"
+        "1) Use numbered points (1., 2., 3.) for all key items.\n"
+        "2) Put each point on a new line, and leave one blank line between points.\n"
+        "3) Do NOT use markdown symbols such as * or **.\n"
+        "4) Do not include unrelated policies.\n"
+        "5) After the answer, add a `Sources:` section listing which [Chunk N] excerpts you relied on.\n"
     )
 
     extra_headers = {
@@ -115,7 +118,10 @@ def generate_answer(
     }
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
         temperature=temperature,
         max_tokens=max_output_tokens,
         extra_headers=extra_headers,

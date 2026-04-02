@@ -311,7 +311,8 @@ def chat_query_stream(request):
     def event_stream():
         # Minimal SSE envelope; frontend can render as it arrives.
         yield "event: start\ndata: {}\n\n"
-        yield f"event: answer\ndata: {answer}\n\n"
+        # JSON-encode to preserve newlines/spacing reliably in SSE clients.
+        yield f"event: answer\ndata: {json.dumps(answer)}\n\n"
         yield f"event: citations\ndata: {json.dumps(citations)}\n\n"
         yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used})}\n\n"
 
