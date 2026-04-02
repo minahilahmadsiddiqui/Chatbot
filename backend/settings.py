@@ -18,6 +18,7 @@ load_dotenv()
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "30"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost:8000")
@@ -28,6 +29,9 @@ OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "google/gemini-2.5-fl
 OPENROUTER_EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
 OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "512"))
 OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.2"))
+# Seconds for each OpenRouter HTTP call (prevents indefinite hangs; raise if answers truncate often).
+OPENROUTER_HTTP_TIMEOUT_SEC = float(os.getenv("OPENROUTER_HTTP_TIMEOUT_SEC", "120"))
+OPENROUTER_MAX_CONTINUATIONS = int(os.getenv("OPENROUTER_MAX_CONTINUATIONS", "1"))
 
 # RAG defaults
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
@@ -35,6 +39,8 @@ RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.3"))
 RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "1600"))
 RAG_INGEST_CHUNK_SIZE_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_SIZE_TOKENS", "500"))
 RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS", "75"))
+# Max points to scroll for lexical fallback (large values slow every chat request).
+RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
 
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
@@ -98,11 +104,12 @@ MIDDLEWARE = [
     ]
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://192.168.50.137:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
 ]
 
-CORS_ALLOW_CREDENTIALS = False
+
+CORS_ALLOW_CREDENTIALS = True
 ROOT_URLCONF = 'backend.urls'
 
 TEMPLATES = [

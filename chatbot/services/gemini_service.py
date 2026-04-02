@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import List, Dict, Any
 
 from django.conf import settings
 from openai import OpenAI
+
+UNKNOWN_POLICY_PHRASE = "The document doesn't mention it, contact the HR department."
 
 
 def _openrouter_client() -> OpenAI:
@@ -12,7 +15,51 @@ def _openrouter_client() -> OpenAI:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
 
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
+    timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+def _beautify_answer(text: str) -> str:
+    """
+    Normalize model output into readable markdown-style sections and bullets.
+    Keeps content unchanged as much as possible while fixing jumbled formatting.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    if t == UNKNOWN_POLICY_PHRASE:
+        return t
+
+    # Force plain-text output (no markdown symbols) and clear line-by-line points.
+    t = t.replace("**", "")
+    t = t.replace("*", "")
+
+    # Break inline list markers into separate lines.
+    t = re.sub(r"([^\n])\s+(\d+[\.\)])\s+", r"\1\n\2 ", t)
+    t = re.sub(r"([^\n])\s+-\s+", r"\1\n- ", t)
+
+    # Normalize common bullet markers to numbered points.
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    out: List[str] = []
+    num = 1
+    for ln in lines:
+        # Keep section-like labels ending with ':'
+        if ln.endswith(":"):
+            out.append(ln)
+            out.append("")
+            num = 1
+            continue
+
+        # Remove existing leading markers.
+        ln = re.sub(r"^(?:-|\d+[\.\)])\s*", "", ln).strip()
+        if not ln:
+            continue
+
+        out.append(f"{num}. {ln}")
+        out.append("")  # one blank line after each point
+        num += 1
+
+    return "\n".join(out).strip()
 
 
 def generate_answer(
@@ -26,11 +73,14 @@ def generate_answer(
 ) -> str:
     """
     Calls OpenRouter Chat Completions API.
-    Response is forced to be grounded by prompt rules.
+    Response is grounded by prompt rules; fallback_phrase is kept only
+    for compatibility with callers and should not normally be returned
+    when context is present.
     """
     client = _openrouter_client()
 
-    # Keep the prompt tight and explicit; fallback must match exact phrase.
+    # Keep the prompt tight and explicit; prefer grounded answers over fallback
+    # when there is any relevant information in the context.
     context_text = "\n\n".join(
         [
             f"[Chunk {i + 1}] {c.get('text', '')}".strip()
@@ -40,10 +90,21 @@ def generate_answer(
     )
 
     prompt = (
-        "You are a retrieval-augmented enterprise assistant.\n"
-        "Answer ONLY using the provided context. If the context does not contain the answer, "
-        f"respond with EXACTLY: {fallback_phrase}\n"
-        "Do not guess. Do not include any other text.\n\n"
+        "You are a retrieval-augmented support assistant for employees using an HR policy chatbot.\n"
+        "Use ONLY the information in the Context section below to answer the Question.\n"
+        "Answer ONLY the specific topic asked in the question.\n"
+        "Do not include unrelated policies or extra sections.\n"
+        "If the question is about one policy (for example gym), include only that policy.\n"
+        "If the context does not contain enough information to answer, respond with exactly:\n"
+        f"\"{UNKNOWN_POLICY_PHRASE}\"\n"
+        "Otherwise, format your answer as follows:\n"
+        "1) Be concise but thorough.\n"
+        "2) Do NOT use markdown symbols such as * or **.\n"
+        "3) Use numbered points (1., 2., 3.) for all key items.\n"
+        "4) Put each point on a new line, and leave one blank line between points.\n"
+        "5) For complex queries, break the answer into logical sections with labels ending in ':'.\n"
+        "6) Do not mention chunks or retrieval internals.\n"
+        "7) Do not add unsupported assumptions; stay grounded in provided context.\n\n"
         f"Question:\n{question}\n\n"
         f"Context:\n{context_text}\n"
     )
@@ -60,7 +121,36 @@ def generate_answer(
         extra_headers=extra_headers,
     )
     content = (response.choices[0].message.content or "").strip()
-    return content or fallback_phrase
+    finish_reason = getattr(response.choices[0], "finish_reason", None)
+
+    # Continuation rounds multiply latency; keep low (raise max_output_tokens instead).
+    max_continuations = min(int(getattr(settings, "OPENROUTER_MAX_CONTINUATIONS", 1)), 3)
+    continuation_count = 0
+    while finish_reason == "length" and content and continuation_count < max_continuations:
+        follow_up = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": content},
+                {
+                    "role": "user",
+                    "content": "Continue exactly from where you stopped. Do not repeat prior lines.",
+                },
+            ],
+            temperature=temperature,
+            max_tokens=max_output_tokens,
+            extra_headers=extra_headers,
+        )
+        continuation = (follow_up.choices[0].message.content or "").strip()
+        if not continuation:
+            break
+        content = f"{content}\n{continuation}".strip()
+        finish_reason = getattr(follow_up.choices[0], "finish_reason", None)
+        continuation_count += 1
+
+    if not content:
+        return UNKNOWN_POLICY_PHRASE
+    return _beautify_answer(content)
 
 
 # Backwards-compatible alias for existing imports.

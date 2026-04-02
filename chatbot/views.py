@@ -116,9 +116,10 @@ def upload_document(request):
 
         points: List[Dict[str, Any]] = []
         for i, (chunk_text, embedding, tok_count) in enumerate(zip(chunks, embeddings, token_counts)):
+            point_id = doc.id * 1_000_000 + i
             points.append(
                 {
-                    "id": f"{doc.id}_{i}",
+                    "id": point_id,
                     "vector": embedding,
                     "payload": {
                         "doc_id": doc.id,
@@ -321,8 +322,8 @@ def chat_query_stream(request):
         content_type="text/event-stream",
     )
 
+    # Basic SSE-friendly headers; avoid hop-by-hop headers like 'Connection'
     response["Cache-Control"] = "no-cache"
     response["X-Accel-Buffering"] = "no"   # helps if you have nginx/reverse proxy
-    response["Connection"] = "keep-alive"
 
     return response

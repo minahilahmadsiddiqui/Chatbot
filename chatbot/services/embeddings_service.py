@@ -19,7 +19,8 @@ def get_embeddings(texts: List[str], *, batch_size: int = 64) -> List[List[float
         "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
         "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
     }
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     embeddings: List[List[float]] = []
     for i in range(0, len(texts), batch_size):
