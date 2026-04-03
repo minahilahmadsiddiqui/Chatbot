@@ -1,7 +1,7 @@
 import hashlib
 import json
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.http import StreamingHttpResponse
@@ -17,7 +17,16 @@ from chatbot.models import ChatMessage, Document
 from chatbot.services.embeddings_service import get_embeddings
 from chatbot.services.qdrant_service import QdrantService
 from chatbot.services.rag_service import FALLBACK_PHRASE, run_rag_query
-from chatbot.services.text_splitter import normalize_text, split_text_into_token_chunks
+from chatbot.services.text_splitter import (
+    handbook_has_auto_structure,
+    handbook_has_section_markers,
+    infer_legacy_chunk_metadata,
+    normalize_handbook_text,
+    normalize_text,
+    split_auto_structured_into_embedding_chunks,
+    split_handbook_into_embedding_chunks,
+    split_text_into_token_chunks,
+)
 
 
 
@@ -45,6 +54,31 @@ def upload_document(request):
       - JSON: {"text": "...", "name": "...optional"}
       - multipart: file upload under key "file" (must be .txt)
 
+    Optional handbook layout (preserves newlines in the file). Each chunk in Qdrant
+    stores: text, source_section (subsection or heading), page_number, chapter_name.
+
+    Explicit blocks:
+
+        SOURCE_SECTION: 3.6 Gym reimbursement
+        PAGE_NUMBER: 18
+        Body text for this section...
+
+    Chapter-style headings (auto-detected, line must start with Chapter/Ch.):
+
+        Chapter 2: Reimbursement
+        Page 48
+        14.7 Purpose
+        Body text...
+
+    Aliases: PAGE: 18, SOURCE SECTION:, PAGE NUMBER:.
+
+    If there are no SOURCE_SECTION lines but the file has chapters, page markers,
+    or numbered headings (e.g. "14.7 Purpose", "=== Page 44 ==="), the line-aware
+    parser fills source_section, page_number, and chapter_name.
+
+    Plain prose with none of the above is chunked as one stream; metadata is
+    inferred per chunk when possible.
+
     No file storage is used; only text is embedded into Qdrant.
     """
     raw_text = request.data.get("text")
@@ -66,32 +100,77 @@ def upload_document(request):
             return Response({"error": "No text provided."}, status=status.HTTP_400_BAD_REQUEST)
         doc_name = request.data.get("name") or "raw_text"
 
-    normalized = normalize_text(content)
-    if not normalized:
-        return Response({"error": "Text is empty after normalization."}, status=status.HTTP_400_BAD_REQUEST)
-
-    content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    existing = Document.objects.filter(content_hash=content_hash).first()
-    if existing:
-        return Response(
-            {
-                "message": "Document already exists",
-                "document_id": existing.id,
-                "chunk_count": existing.chunk_count,
-                "token_count": existing.token_count,
-                "embedding_count": existing.embedding_count,
-                "status": existing.status,
-            },
-            status=status.HTTP_200_OK,
-        )
+    handbook_norm = normalize_handbook_text(content)
+    use_explicit_sections = handbook_has_section_markers(handbook_norm)
+    use_auto_structure = (not use_explicit_sections) and handbook_has_auto_structure(handbook_norm)
 
     chunk_size_tokens = int(getattr(settings, "RAG_INGEST_CHUNK_SIZE_TOKENS", 500))
     overlap_tokens = int(getattr(settings, "RAG_INGEST_CHUNK_OVERLAP_TOKENS", 75))
     embedding_batch_size = int(getattr(settings, "EMBEDDING_BATCH_SIZE", 64))
 
-    chunks, token_counts = split_text_into_token_chunks(
-        normalized, chunk_size_tokens=chunk_size_tokens, overlap_tokens=overlap_tokens
+    handbook_rows: List[Tuple[str, int, str, Optional[int], str]] = []
+    if use_explicit_sections:
+        handbook_rows = split_handbook_into_embedding_chunks(
+            handbook_norm,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    elif use_auto_structure:
+        handbook_rows = split_auto_structured_into_embedding_chunks(
+            handbook_norm,
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+
+    if handbook_rows:
+        normalized = handbook_norm
+        chunks = [r[0] for r in handbook_rows]
+        token_counts = [r[1] for r in handbook_rows]
+        chunk_meta = [(r[2], r[3], r[4]) for r in handbook_rows]
+    else:
+        normalized = normalize_text(content)
+        if not normalized:
+            return Response({"error": "Text is empty after normalization."}, status=status.HTTP_400_BAD_REQUEST)
+        chunks, token_counts = split_text_into_token_chunks(
+            normalized, chunk_size_tokens=chunk_size_tokens, overlap_tokens=overlap_tokens
+        )
+        chunk_meta = [infer_legacy_chunk_metadata(c) for c in chunks]
+
+    # Include ingest settings in the dedupe fingerprint so re-uploads after
+    # chunking/config changes are re-indexed instead of silently reusing stale vectors.
+    fingerprint = json.dumps(
+        {
+            "text": normalized,
+            "chunk_size_tokens": chunk_size_tokens,
+            "overlap_tokens": overlap_tokens,
+            "embedding_model": str(getattr(settings, "OPENROUTER_EMBEDDING_MODEL", "")),
+            "ingest_version": "v2",
+        },
+        sort_keys=True,
+        ensure_ascii=False,
     )
+    content_hash = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    existing = Document.objects.filter(content_hash=content_hash).first()
+    force_reindex_raw = request.data.get("force_reindex")
+    force_reindex = str(force_reindex_raw or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if existing:
+        if force_reindex:
+            qdrant = QdrantService()
+            qdrant.delete_by_doc_id(existing.id)
+            existing.delete()
+        else:
+            return Response(
+                {
+                    "message": "Document already exists",
+                    "document_id": existing.id,
+                    "chunk_count": existing.chunk_count,
+                    "token_count": existing.token_count,
+                    "embedding_count": existing.embedding_count,
+                    "status": existing.status,
+                },
+                status=status.HTTP_200_OK,
+            )
+
     if not chunks:
         return Response({"error": "Unable to chunk provided text."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -115,19 +194,25 @@ def upload_document(request):
             raise RuntimeError("Embeddings returned unexpected count.")
 
         points: List[Dict[str, Any]] = []
-        for i, (chunk_text, embedding, tok_count) in enumerate(zip(chunks, embeddings, token_counts)):
+        for i, (chunk_text, embedding, tok_count, meta) in enumerate(
+            zip(chunks, embeddings, token_counts, chunk_meta)
+        ):
             point_id = doc.id * 1_000_000 + i
+            section_title, page_num, chapter_name = meta
+            payload: Dict[str, Any] = {
+                "doc_id": doc.id,
+                "chunk_index": i,
+                "chunk_id": f"{doc.id}_{i}",
+                "text": chunk_text,
+                "token_count": tok_count,
+                "source_section": section_title or "",
+                "page_number": page_num,
+            }
             points.append(
                 {
                     "id": point_id,
                     "vector": embedding,
-                    "payload": {
-                        "doc_id": doc.id,
-                        "chunk_index": i,
-                        "chunk_id": f"{doc.id}_{i}",
-                        "text": chunk_text,
-                        "token_count": tok_count,
-                    },
+                    "payload": payload,
                 }
             )
 
@@ -258,6 +343,8 @@ def chat_query(request):
             "latency_ms": latency_ms,
             "top_k": result.get("top_k"),
             "threshold": result.get("threshold"),
+            "rag_retrieval_ran": result.get("rag_retrieval_ran"),
+            "pipeline": result.get("pipeline"),
         },
         status=status.HTTP_200_OK,
     )
@@ -314,7 +401,7 @@ def chat_query_stream(request):
         # JSON-encode to preserve newlines/spacing reliably in SSE clients.
         yield f"event: answer\ndata: {json.dumps(answer)}\n\n"
         yield f"event: citations\ndata: {json.dumps(citations)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used, 'rag_retrieval_ran': result.get('rag_retrieval_ran'), 'pipeline': result.get('pipeline')})}\n\n"
 
    # return StreamingHttpResponse(event_stream(), content_type="text/event-stream")
    

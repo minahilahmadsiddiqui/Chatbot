@@ -1,3 +1,4 @@
+from typing import Optional
 
 from django.conf import settings
 from qdrant_client import QdrantClient
@@ -6,6 +7,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PointStruct,
     VectorParams,
     FilterSelector,
     PayloadSchemaType,
@@ -27,7 +29,54 @@ class QdrantService:
         )
         self.collection_name = getattr(settings, "QDRANT_COLLECTION_NAME", "documents")
         self.vector_size = getattr(settings, "QDRANT_VECTOR_SIZE", 1536)
+        # Named-vector collections (common when created in Qdrant Cloud UI) require
+        # vector={"name": [...]} on upsert and `using=name` on query.
+        self._vector_using: str | None = None
         self._ensure_collection()
+        self._vector_using = self._resolve_vector_using()
+
+    def _named_vector_keys(self, vectors_config) -> list[str]:
+        if vectors_config is None:
+            return []
+        if isinstance(vectors_config, VectorParams):
+            return []
+        if isinstance(vectors_config, dict):
+            return [str(k) for k in vectors_config.keys() if k is not None]
+        keys = getattr(vectors_config, "keys", None)
+        if callable(keys):
+            try:
+                return [str(k) for k in list(keys())]
+            except Exception:
+                return []
+        return []
+
+    def _resolve_vector_using(self) -> str | None:
+        explicit = getattr(settings, "QDRANT_VECTOR_NAME", None)
+        if explicit:
+            return str(explicit).strip() or None
+        if not self.client.collection_exists(self.collection_name):
+            return None
+        try:
+            info = self.client.get_collection(self.collection_name)
+            params = getattr(getattr(info, "config", None), "params", None)
+            vectors = getattr(params, "vectors", None) if params is not None else None
+            names = self._named_vector_keys(vectors)
+            if len(names) == 1:
+                return names[0]
+            if len(names) > 1:
+                # Prefer a common default name if present.
+                for candidate in ("default", "dense", "text", "embedding"):
+                    if candidate in names:
+                        return candidate
+                return names[0]
+        except Exception:
+            return None
+        return None
+
+    def _wrap_vector(self, embedding: list) -> list | dict:
+        if self._vector_using:
+            return {self._vector_using: embedding}
+        return embedding
 
     def _ensure_collection(self) -> None:
         if not self.client.collection_exists(self.collection_name):
@@ -50,45 +99,80 @@ class QdrantService:
             pass
 
     def add_embeddings(self, points) -> None:
-        self.client.upsert(collection_name=self.collection_name, points=points)
+        batch: list[PointStruct] = []
+        for p in points:
+            if isinstance(p, PointStruct):
+                batch.append(p)
+            else:
+                vec = self._wrap_vector(p["vector"])
+                batch.append(
+                    PointStruct(
+                        id=p["id"],
+                        vector=vec,
+                        payload=p.get("payload") or {},
+                    )
+                )
+        self.client.upsert(collection_name=self.collection_name, points=batch)
 
     def search(self, query_vector, *, limit: int = 5):
-        # Support both old and new qdrant-client APIs.
+        # Prefer query_points (current qdrant-client); pass `using` for named-vector collections.
+        query_fn = getattr(self.client, "query_points", None)
+        if query_fn is not None:
+            result = query_fn(
+                collection_name=self.collection_name,
+                query=query_vector,
+                limit=limit,
+                using=self._vector_using,
+            )
+            points = getattr(result, "points", None)
+            return points if points is not None else result
         if hasattr(self.client, "search"):
             return self.client.search(
                 collection_name=self.collection_name,
                 query_vector=query_vector,
                 limit=limit,
             )
+        return []
 
-        result = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            limit=limit,
-        )
-        points = getattr(result, "points", None)
-        return points if points is not None else result
-
-    def scan_payload_points(self, *, limit: int = 500):
+    def scan_payload_points(self, *, limit: int = 256, max_points: Optional[int] = None):
         """
-        Returns raw points with payloads by scrolling the collection.
-        Used as a lexical fallback when semantic retrieval misses exact wording.
+        Scroll payloads (no vectors) for lexical / BM25 scoring over the collection.
+        Paginates until `max_points` or the collection is exhausted.
         """
         if not hasattr(self.client, "scroll"):
             return []
 
-        result = self.client.scroll(
-            collection_name=self.collection_name,
-            with_payload=True,
-            with_vectors=False,
-            limit=limit,
-        )
-        if isinstance(result, tuple):
-            # qdrant-client commonly returns (points, next_page_offset)
-            return result[0] or []
+        cap = max_points if max_points is not None else limit
+        out: list = []
+        offset = None
+        batch = max(1, min(int(limit), 256))
 
-        points = getattr(result, "points", None)
-        return points or []
+        while len(out) < cap:
+            take = min(batch, cap - len(out))
+            try:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=take,
+                    offset=offset,
+                )
+            except Exception:
+                break
+
+            if isinstance(result, tuple):
+                points, offset = result[0] or [], result[1]
+            else:
+                points = getattr(result, "points", None) or []
+                offset = getattr(result, "next_page_offset", None)
+
+            if not points:
+                break
+            out.extend(points)
+            if offset is None:
+                break
+
+        return out
 
     def delete_by_doc_id(self, document_id: int) -> None:
         flt = Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=document_id))])

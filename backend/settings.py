@@ -19,6 +19,9 @@ load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "30"))
+QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "documents")
+# If the Qdrant collection uses named vectors (e.g. created in Cloud UI), set this to that name.
+QDRANT_VECTOR_NAME = os.getenv("QDRANT_VECTOR_NAME", "").strip() or None
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost:8000")
@@ -27,26 +30,86 @@ OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "chatbot-backend")
 # OpenRouter model defaults (override via env vars when deploying).
 OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")
 OPENROUTER_EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
-OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "512"))
+OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "1024"))
 OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.2"))
 # Seconds for each OpenRouter HTTP call (prevents indefinite hangs; raise if answers truncate often).
 OPENROUTER_HTTP_TIMEOUT_SEC = float(os.getenv("OPENROUTER_HTTP_TIMEOUT_SEC", "120"))
+# Embeddings can hit upstream 408s; allow a longer client read timeout than chat.
+OPENROUTER_EMBEDDING_TIMEOUT_SEC = float(os.getenv("OPENROUTER_EMBEDDING_TIMEOUT_SEC", "180"))
+OPENROUTER_EMBEDDING_MAX_RETRIES = int(os.getenv("OPENROUTER_EMBEDDING_MAX_RETRIES", "6"))
 OPENROUTER_MAX_CONTINUATIONS = int(os.getenv("OPENROUTER_MAX_CONTINUATIONS", "1"))
 
 # RAG defaults
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.3"))
-RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "1600"))
+# Dense cosine-style similarity floor (lower = more recall).
+RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.15"))
+# Keep chunks scoring at least this fraction of the best dense hit (improves recall).
+RAG_SEMANTIC_RELATIVE_FLOOR = float(os.getenv("RAG_SEMANTIC_RELATIVE_FLOOR", "0.78"))
+# Set true only if your Qdrant scores are distances (lower = better), not similarities.
+RAG_SEMANTIC_SCORE_LOWER_IS_BETTER = os.getenv("RAG_SEMANTIC_SCORE_LOWER_IS_BETTER", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "3200"))
+# When packing context, skip a tiny tail smaller than this (tokens) unless it is the first chunk.
+RAG_CONTEXT_MIN_TAIL_TOKENS = int(os.getenv("RAG_CONTEXT_MIN_TAIL_TOKENS", "100"))
+# Dense search pool size = max(top_k * multiplier, min_below).
+RAG_SEMANTIC_CANDIDATE_MULTIPLIER = int(os.getenv("RAG_SEMANTIC_CANDIDATE_MULTIPLIER", "16"))
+RAG_SEMANTIC_CANDIDATE_MIN = int(os.getenv("RAG_SEMANTIC_CANDIDATE_MIN", "96"))
 RAG_INGEST_CHUNK_SIZE_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_SIZE_TOKENS", "500"))
 RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS", "75"))
-# Max points to scroll for lexical fallback (large values slow every chat request).
+# Lexical channel: scroll page size and max total points (large values slow each request).
 RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
+RAG_LEXICAL_MAX_POINTS = int(os.getenv("RAG_LEXICAL_MAX_POINTS", "1200"))
+# Always merge at least this many top RRF rows into context (deduped by chunk).
+RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "18"))
+# Reciprocal rank fusion k (standard ~60). Merges dense + BM25 lists every query.
+RAG_HYBRID_RRF_K = int(os.getenv("RAG_HYBRID_RRF_K", "60"))
+# Min BM25 score for a lexical-only hit to pass the filter (0 = any keyword hit with min overlap).
+RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.0"))
+# If true, block some queries as "gibberish" BEFORE embeddings/Qdrant (can false-positive real HR questions).
+RAG_ENABLE_GIBBERISH_FILTER = os.getenv("RAG_ENABLE_GIBBERISH_FILTER", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 
 # Strict, non-hallucinating answering mode:
 # - When enabled, responses are assembled from verbatim sentences found in retrieved chunks.
 # - When disabled, the LLM can paraphrase (higher fluency, lower guarantee).
 RAG_STRICT_NO_HALLUCINATE = os.getenv("RAG_STRICT_NO_HALLUCINATE", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "4"))
+# Sentences selected for strict extractive answers (embedding-ranked).
+RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "6"))
+# How many cleaned sentences to join into the main paragraph (can be > selection count).
+RAG_STRICT_ANSWER_BODY_SENTENCES = int(os.getenv("RAG_STRICT_ANSWER_BODY_SENTENCES", "8"))
+RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "4500"))
+RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "16000"))
+RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "6"))
+# Drop strict-mode chunks whose context BM25 is below this fraction of the best chunk (0 = off).
+RAG_STRICT_BM25_RELATIVE_FLOOR = float(os.getenv("RAG_STRICT_BM25_RELATIVE_FLOOR", "0.12"))
+# Prefer lines that match query terms (fewer unrelated policy paragraphs in the answer).
+RAG_STRICT_QUERY_FOCUSED_BODY = os.getenv("RAG_STRICT_QUERY_FOCUSED_BODY", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+# If strict verbatim assembly returns nothing, call the LLM with a recall-oriented prompt.
+RAG_STRICT_FALLBACK_TO_LLM = os.getenv("RAG_STRICT_FALLBACK_TO_LLM", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+# Max bullet lines in strict sentence fallback.
+RAG_STRICT_EXTRACTIVE_MAX_BULLETS = int(os.getenv("RAG_STRICT_EXTRACTIVE_MAX_BULLETS", "10"))
 
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))

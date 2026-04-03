@@ -70,6 +70,7 @@ def generate_answer(
     model: str = "google/gemini-2.5-flash",
     max_output_tokens: int = 512,
     temperature: float = 0.2,
+    prefer_answer_from_context: bool = False,
 ) -> str:
     """
     Calls OpenRouter Chat Completions API.
@@ -89,16 +90,35 @@ def generate_answer(
         ]
     )
 
-    system_prompt = (
-        "You are an employee handbook assistant.\n"
-        "Answer ONLY from the provided handbook excerpts.\n"
-        "Never invent or infer company policy.\n"
-        f"If the handbook does not explicitly mention the policy, respond with exactly: \"{UNKNOWN_POLICY_PHRASE}\".\n"
-        "Do not answer using loosely related policies.\n"
-        "Prefer exact section wording over paraphrased assumptions.\n"
-        "Quote or cite section titles when possible.\n"
-        "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
+    concise = (
+        "Be concise: answer only what the question asks; omit unrelated policies, examples, "
+        "and background that does not directly address the question.\n"
     )
+
+    if prefer_answer_from_context:
+        system_prompt = (
+            "You are an employee handbook assistant.\n"
+            + concise
+            + "The user question should be answered using ONLY the provided Context excerpts.\n"
+            "If the excerpts contain ANY information that reasonably addresses the question "
+            "(even partial, or spread across chunks), summarize that information clearly.\n"
+            "Do not invent facts that are not supported by the Context.\n"
+            f"Use the exact phrase \"{UNKNOWN_POLICY_PHRASE}\" ONLY when the excerpts do not "
+            "contain relevant information for the question at all.\n"
+            "Prefer quoting or paraphrasing closely from the excerpts; cite [Chunk N] in Sources.\n"
+        )
+    else:
+        system_prompt = (
+            "You are an employee handbook assistant.\n"
+            + concise
+            + "Answer ONLY from the provided handbook excerpts.\n"
+            "Never invent or infer company policy.\n"
+            f"If the handbook does not explicitly mention the policy, respond with exactly: \"{UNKNOWN_POLICY_PHRASE}\".\n"
+            "Do not answer using loosely related policies.\n"
+            "Prefer exact section wording over paraphrased assumptions.\n"
+            "Quote or cite section titles when possible.\n"
+            "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
+        )
     prompt = (
         "Context (authoritative):\n"
         f"{context_text}\n\n"
@@ -108,7 +128,7 @@ def generate_answer(
         "1) Use numbered points (1., 2., 3.) for all key items.\n"
         "2) Put each point on a new line, and leave one blank line between points.\n"
         "3) Do NOT use markdown symbols such as * or **.\n"
-        "4) Do not include unrelated policies.\n"
+        "4) Do not include unrelated policies or sections — only what answers the question.\n"
         "5) After the answer, add a `Sources:` section listing which [Chunk N] excerpts you relied on.\n"
     )
 
@@ -176,5 +196,6 @@ def generate_gemini_answer(
         model=model,
         max_output_tokens=max_output_tokens,
         temperature=temperature,
+        prefer_answer_from_context=False,
     )
 

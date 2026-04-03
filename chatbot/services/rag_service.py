@@ -11,9 +11,12 @@ from django.conf import settings
 from chatbot.services.embeddings_service import get_embeddings
 from chatbot.services.gemini_service import UNKNOWN_POLICY_PHRASE, generate_answer
 from chatbot.services.qdrant_service import QdrantService
-from chatbot.services.text_splitter import count_tokens
+from chatbot.services.text_splitter import count_tokens, line_looks_like_toc_leader, truncate_text_to_token_budget
 
 FALLBACK_PHRASE = "Contact the HR department"
+_HANDBOOK_ASSISTANT_GREETING = (
+    "Hello! I can help you find information in the employee handbook. What would you like to know?"
+)
 _STOPWORDS = {
     "a",
     "an",
@@ -56,31 +59,26 @@ _STOPWORDS = {
     "give",
     "provide",
 }
+# Strip only meta / filler words from anchors — do NOT strip handbook vocabulary
+# like policy, employee, work, or company names (those are real topics).
 _GENERIC_QUERY_TERMS = {
-    "acme",
-    "company",
-    "consultants",
-    "document",
-    "employee",
-    "employees",
-    "policy",
-    "policies",
-    "rule",
-    "rules",
-    "using",
-    "use",
-    "work",
-    "working",
-    "specific",
-    "specifically",
-    "name",
-    "current",
-    "activities",
-    "network",
-    "information",
-    "mentioned",
-    "present",
-    "about",
+    "explain",
+    "describe",
+    "tell",
+    "summarize",
+    "summarise",
+    "show",
+    "give",
+    "provide",
+    "please",
+    "kindly",
+    "something",
+    "anything",
+    "everything",
+    "just",
+    "also",
+    "really",
+    "very",
 }
 _TYPO_CANONICAL_TERMS = {
     # Greeting/conversation
@@ -119,6 +117,11 @@ _TYPO_CANONICAL_TERMS = {
 }
 
 
+def _pipeline_fields(*, rag_retrieval_ran: bool, pipeline: str) -> Dict[str, Any]:
+    """Diagnostics: whether embeddings/Qdrant ran; which code path produced the answer."""
+    return {"rag_retrieval_ran": rag_retrieval_ran, "pipeline": pipeline}
+
+
 class RagState(TypedDict, total=False):
     query: str
     query_embedding: List[float]
@@ -146,14 +149,33 @@ def _normalize_query_typos(query: str) -> str:
     if not query:
         return query
 
+    # Explicit typo fixes we rely on in unit tests and common HR queries.
+    # (We keep this small and deterministic; everything else uses fuzzy matching.)
+    common_typo_map = {
+        "reimbursment": "reimbursement",
+        "polciy": "policy",
+        "polciies": "policies",
+        "employes": "employees",
+    }
+
     def fix_token(tok: str) -> str:
         lower = tok.lower()
         # Avoid over-correcting short tokens and already-known words.
         if len(lower) < 4 or lower in _TYPO_CANONICAL_TERMS:
             return tok
+        if lower in common_typo_map:
+            corrected = common_typo_map[lower]
+            if tok.isupper():
+                return corrected.upper()
+            if tok[0].isupper():
+                return corrected.capitalize()
+            return corrected
         if not lower.isalpha():
             return tok
-        match = difflib.get_close_matches(lower, _TYPO_CANONICAL_TERMS, n=1, cutoff=0.86)
+        # Sort to keep matching deterministic across Python runs (since _TYPO_CANONICAL_TERMS is a set).
+        match = difflib.get_close_matches(
+            lower, sorted(_TYPO_CANONICAL_TERMS), n=1, cutoff=0.86
+        )
         if not match:
             return tok
         corrected = match[0]
@@ -209,17 +231,21 @@ def _is_greeting(query: str) -> bool:
         return True
     if looks_like_how_are_you(tokens):
         return True
-    greetings = (
-        "hi",
-        "hello",
-        "hey",
-        "salam",
-        "assalam",
-        "assalam-o-alaikum",
-        "assalamualaikum",
-        "aoa",
-    )
-    return any(g in q for g in greetings)
+    # Word-boundary only — substring checks like `"hi" in q` match "hiring", "highlight", etc.
+    if re.search(r"(?<![a-z0-9])(assalam|assalam-o-alaikum|assalamualaikum)(?![a-z0-9])", q_compact):
+        return True
+    if re.search(r"(?<![a-z0-9])salam(?![a-z0-9])", q_compact) and len(tokens) <= 5:
+        return True
+    if re.search(r"(?<![a-z0-9])aoa(?![a-z0-9])", q_compact) and len(tokens) <= 4:
+        return True
+    # Short standalone hi / hello / hey (not substrings inside longer words)
+    if len(q_compact) <= 48:
+        if re.fullmatch(
+            r"(hi|hello|hey)(\s+(there|team|everyone|all))?(\s*[!\.]*)?",
+            q_compact,
+        ):
+            return True
+    return False
 
 
 def _greeting_answer(query: str) -> str:
@@ -264,13 +290,18 @@ def _greeting_answer(query: str) -> str:
         p in q for p in ("doing well", "all good", "im good", "i'm good")
     ):
         return "Glad to hear it. What can I help you find in the employee handbook?"
-    if any(k in q for k in ("assalam", "assalam-o-alaikum", "assalamualaikum", "salam", "aoa")):
-        return "waalaikum assalam"
-    if "hello" in q:
-        return "hello"
-    if "hi" in q:
-        return "hi"
-    return "hello"
+    if re.search(r"(?<![a-z0-9])(assalam|assalam-o-alaikum|assalamualaikum)(?![a-z0-9])", q_compact):
+        return "Wa alaikum assalam. How can I help you with the employee handbook?"
+    if re.search(r"(?<![a-z0-9])salam(?![a-z0-9])", q_compact) and len(tokens) <= 5:
+        return "Wa alaikum assalam. How can I help you with the employee handbook?"
+    if re.search(r"(?<![a-z0-9])aoa(?![a-z0-9])", q_compact):
+        return "Wa alaikum assalam. How can I help you with the employee handbook?"
+    if len(q_compact) <= 48 and re.fullmatch(
+        r"(hi|hello|hey)(\s+(there|team|everyone|all))?(\s*[!\.]*)?",
+        q_compact,
+    ):
+        return _HANDBOOK_ASSISTANT_GREETING
+    return _HANDBOOK_ASSISTANT_GREETING
 
 
 def _build_context(
@@ -278,35 +309,182 @@ def _build_context(
     *,
     max_context_tokens: int,
 ) -> List[Dict[str, Any]]:
+    """
+    Pack chunks in retrieval (rerank) order so the best hits use the budget first.
+    Truncates an oversized or final chunk to fill remaining tokens instead of skipping it.
+    """
     context: List[Dict[str, Any]] = []
     running_tokens = 0
+    min_tail_tokens = int(getattr(settings, "RAG_CONTEXT_MIN_TAIL_TOKENS", 100))
+
     for r in retrieved:
         payload = r.get("payload") or {}
-        text = payload.get("text") or ""
+        text = str(payload.get("text") or "")
         if not text:
             continue
 
-        token_count = payload.get("token_count")
-        if token_count is None:
-            token_count = count_tokens(text)
+        full_tc = payload.get("token_count")
+        if full_tc is None:
+            full_tc = count_tokens(text)
+        try:
+            full_tc = int(full_tc)
+        except (TypeError, ValueError):
+            full_tc = count_tokens(text)
 
-        # Hard cap: stop adding more once max is reached.
-        if running_tokens + token_count > max_context_tokens and context:
+        room = max_context_tokens - running_tokens
+        if room <= 0:
             break
+
+        use_text = text
+        token_count = full_tc
+        if token_count > room:
+            if room < min_tail_tokens and context:
+                break
+            use_text = truncate_text_to_token_budget(text, room)
+            token_count = count_tokens(use_text)
+            if token_count <= 0:
+                continue
 
         context.append(
             {
-                "text": text,
+                "text": use_text,
                 "doc_id": payload.get("doc_id"),
                 "chunk_id": payload.get("chunk_id"),
                 "chunk_index": payload.get("chunk_index"),
                 "token_count": token_count,
                 "score": r.get("score"),
+                "source_section": (payload.get("source_section") or "").strip(),
+                "page_number": payload.get("page_number"),
             }
         )
         running_tokens += token_count
 
     return context
+
+
+def _dense_candidate_limit(top_k: int) -> int:
+    mult = max(1, int(getattr(settings, "RAG_SEMANTIC_CANDIDATE_MULTIPLIER", 16)))
+    floor = max(1, int(getattr(settings, "RAG_SEMANTIC_CANDIDATE_MIN", 96)))
+    return max(top_k * mult, floor)
+
+
+def _retrieved_row_chunk_key(row: Dict[str, Any]) -> str:
+    pl = row.get("payload") or {}
+    cid = pl.get("chunk_id")
+    if cid is not None and str(cid).strip():
+        return str(cid)
+    return f"{pl.get('doc_id')}_{pl.get('chunk_index')}"
+
+
+def _hybrid_filter_for_context(
+    retrieved: List[Dict[str, Any]],
+    *,
+    query: str,
+    top_k: int,
+    threshold: float,
+) -> List[Dict[str, Any]]:
+    """
+    Keep chunks that pass dense threshold OR are within a relative margin of the best
+    dense score OR have lexical (BM25) signal. Always union top RRF rows so the best
+    fused ranking still reaches strict mode even when raw cosine sits below the floor.
+    """
+    if not retrieved:
+        return []
+
+    _ = query  # kept for API symmetry / future query-conditioned filtering
+
+    bm25_min = float(getattr(settings, "RAG_LEXICAL_BM25_MIN", 0.0))
+    min_lexical_overlap = 1
+
+    sem_scores: List[float] = []
+    for r in retrieved:
+        s = r.get("score")
+        if s is None:
+            continue
+        try:
+            sem_scores.append(float(s))
+        except (TypeError, ValueError):
+            pass
+    max_sem = max(sem_scores) if sem_scores else None
+    min_sem = min(sem_scores) if sem_scores else None
+    relative = float(getattr(settings, "RAG_SEMANTIC_RELATIVE_FLOOR", 0.78))
+    lower_is_better = bool(getattr(settings, "RAG_SEMANTIC_SCORE_LOWER_IS_BETTER", False))
+
+    def passes_semantic(sem_f: float) -> bool:
+        if lower_is_better:
+            if sem_f <= threshold:
+                return True
+            if min_sem is not None and min_sem > 1e-12:
+                return sem_f <= min_sem / max(relative, 0.5)
+            return False
+        if sem_f >= threshold:
+            return True
+        if max_sem is not None and max_sem > 1e-12:
+            return sem_f >= max_sem * relative
+        return False
+
+    primary: List[Dict[str, Any]] = []
+    for r in retrieved:
+        sem_f: Optional[float] = None
+        if r.get("score") is not None:
+            try:
+                sem_f = float(r["score"])
+            except (TypeError, ValueError):
+                sem_f = None
+        sem_ok = passes_semantic(sem_f) if sem_f is not None else False
+        ov = int(r.get("_overlap") or 0)
+        bm25 = float(r.get("_bm25") or 0)
+        lex_ok = bm25 > bm25_min and ov >= min_lexical_overlap
+        if sem_ok or lex_ok:
+            primary.append(r)
+
+    seen: set[str] = set()
+    merged: List[Dict[str, Any]] = []
+    for r in primary:
+        k = _retrieved_row_chunk_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(r)
+
+    rrf_slots = max(int(getattr(settings, "RAG_RRF_MIN_GUARANTEE", 18)), top_k * 3)
+    by_rrf = sorted(retrieved, key=lambda x: -float(x.get("_rrf", 0)))
+    for r in by_rrf[:rrf_slots]:
+        k = _retrieved_row_chunk_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(r)
+
+    if not merged:
+        return list(retrieved[: max(top_k * 4, 24)])
+
+    return merged
+
+
+def _citation_source_fields(chunk: Dict[str, Any]) -> tuple[Optional[str], Optional[int]]:
+    sec = (chunk.get("source_section") or "").strip() or None
+    page: Optional[int] = None
+    raw_page = chunk.get("page_number")
+    if raw_page is not None:
+        try:
+            page = int(raw_page)
+        except (TypeError, ValueError):
+            page = None
+    return sec, page
+
+
+def _citation_entry(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    sec, pg = _citation_source_fields(chunk)
+    return {
+        "doc_id": chunk.get("doc_id"),
+        "chunk_index": chunk.get("chunk_index"),
+        "chunk_id": chunk.get("chunk_id"),
+        "text_preview": _text_preview(chunk.get("text") or ""),
+        "token_count": chunk.get("token_count"),
+        "source_section": sec,
+        "page": pg,
+    }
 
 
 def _text_preview(text: str, *, max_chars: int = 250) -> str:
@@ -324,20 +502,377 @@ def _tokenize_keywords(text: str) -> set[str]:
     }
 
 
-def _anchor_terms(query: str) -> set[str]:
-    terms = _tokenize_keywords(query)
-    # Allow shorter topic tokens (e.g. "gym") to participate in grounding,
-    # while still excluding generic query terms and stopwords.
-    anchors = {t for t in terms if t not in _GENERIC_QUERY_TERMS and len(t) >= 3}
-    return anchors if anchors else terms
+def _retrieval_terms(question: str) -> set[str]:
+    """
+    Terms for matching user questions to chunk text. Excludes only generic
+    filler/meta tokens (not normal handbook words like policy, employee, work).
+    """
+    terms = _tokenize_keywords(question)
+    out = {t for t in terms if t not in _GENERIC_QUERY_TERMS and len(t) >= 2}
+    return out if out else terms
+
+
+def _chunk_reading_key(chunk: Dict[str, Any]) -> tuple[int, int, str]:
+    try:
+        doc_id = int(chunk.get("doc_id") or 0)
+    except (TypeError, ValueError):
+        doc_id = 0
+    raw = chunk.get("chunk_index")
+    try:
+        idx = int(raw) if raw is not None else -1
+    except (TypeError, ValueError):
+        idx = -1
+    return (doc_id, idx, str(chunk.get("chunk_id") or ""))
+
+
+def _sort_chunks_by_reading_order(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(chunks, key=_chunk_reading_key)
+
+
+def _bm25_score_documents(
+    docs: List[tuple[str, str]],
+    keywords: List[str],
+    *,
+    k1: float = 1.2,
+    b: float = 0.75,
+) -> List[float]:
+    """
+    BM25 over an in-memory corpus (scanned Qdrant payloads or retrieved context).
+    Keywords come from the live query only — no static topic lists.
+    """
+    if not docs:
+        return []
+    if not keywords:
+        return [0.0] * len(docs)
+
+    N = len(docs)
+    blobs: List[str] = []
+    lengths: List[int] = []
+    for body, sec in docs:
+        blob = f"{body} {sec}".strip().lower()
+        blobs.append(blob)
+        lengths.append(max(len(blob.split()), 1))
+    avgdl = sum(lengths) / N
+
+    df: Dict[str, int] = {kw: 0 for kw in keywords}
+    term_freqs: List[Dict[str, int]] = []
+    for blob in blobs:
+        tf: Dict[str, int] = {}
+        for kw in keywords:
+            pat = rf"(?<!\w){re.escape(kw)}(?!\w)"
+            n = len(re.findall(pat, blob, flags=re.IGNORECASE))
+            if n > 0:
+                tf[kw] = n
+                df[kw] += 1
+        term_freqs.append(tf)
+
+    idf: Dict[str, float] = {}
+    for kw in keywords:
+        d = df.get(kw, 0)
+        idf[kw] = math.log(1.0 + (N - d + 0.5) / (d + 0.5))
+
+    scores: List[float] = []
+    for i in range(N):
+        dl = lengths[i]
+        s = 0.0
+        for kw in keywords:
+            f = term_freqs[i].get(kw, 0)
+            if f == 0:
+                continue
+            denom = f + k1 * (1.0 - b + b * dl / avgdl)
+            s += idf[kw] * (f * (k1 + 1.0)) / denom
+        scores.append(s)
+    return scores
+
+
+def _strict_chunk_scores(
+    context_chunks: List[Dict[str, Any]],
+    *,
+    q_terms: set[str],
+    min_overlap: int,
+    chunk_order: Dict[str, int],
+) -> List[tuple[float, int, int, Dict[str, Any]]]:
+    """
+    Rank context chunks with BM25 + token overlap on the retrieved set (dynamic IDF).
+    """
+    keywords = list(q_terms)
+    rows: List[tuple[str, str, Dict[str, Any]]] = []
+    for c in context_chunks:
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        sec = str(c.get("source_section") or "")
+        combined_terms = _tokenize_keywords(text) | _tokenize_keywords(sec)
+        overlap = len(q_terms.intersection(combined_terms))
+        if overlap < min_overlap:
+            continue
+        rows.append((text, sec, c))
+
+    if not rows:
+        return []
+
+    docs = [(t, s) for t, s, _ in rows]
+    bm25s = _bm25_score_documents(docs, keywords) if keywords else [0.0] * len(rows)
+
+    scored: List[tuple[float, int, int, Dict[str, Any]]] = []
+    for i, (_t, _s, c) in enumerate(rows):
+        text = str(c.get("text") or "").strip()
+        sec = str(c.get("source_section") or "")
+        overlap = len(q_terms.intersection(_tokenize_keywords(text) | _tokenize_keywords(sec)))
+        cid = str(c.get("chunk_id") or "")
+        scored.append((bm25s[i] if i < len(bm25s) else 0.0, overlap, chunk_order.get(cid, 999), c))
+
+    scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+    return scored
+
+
+def _strict_body_from_chunks_ordered(
+    chunks: List[Dict[str, Any]],
+    *,
+    max_chars: int,
+    respect_input_order: bool = False,
+) -> str:
+    """
+    Verbatim handbook prose. By default, sorts by document reading order.
+    When respect_input_order is True, uses the caller's list order (e.g. relevance first).
+    """
+    ordered = chunks if respect_input_order else _sort_chunks_by_reading_order(chunks)
+    parts: List[str] = []
+    total = 0
+    for c in ordered:
+        lines: List[str] = []
+        for raw in str(c.get("text") or "").splitlines():
+            ln = raw.strip()
+            if not ln or line_looks_like_toc_leader(ln):
+                continue
+            lines.append(ln)
+        block = _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        if not block:
+            continue
+        add = len(block) + (1 if parts else 0)
+        if parts and total + add > max_chars:
+            room = max_chars - total - 1
+            if room > 120:
+                block = block[:room].rsplit(" ", 1)[0].rstrip(",;:") + " …"
+                parts.append(block)
+            break
+        parts.append(block)
+        total += add
+    return " ".join(parts).strip()
+
+
+def _line_matches_any_query_term(line: str, terms: set[str]) -> bool:
+    low = line.lower()
+    for t in terms:
+        if len(t) < 2:
+            continue
+        if re.search(rf"(?<!\w){re.escape(t)}(?!\w)", low, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _strict_body_query_focused(
+    chunks: List[Dict[str, Any]],
+    *,
+    query_terms: set[str],
+    max_chars: int,
+    respect_input_order: bool,
+) -> str:
+    """Prefer lines that contain query keywords (verbatim); reduces unrelated policy prose."""
+    ordered = chunks if respect_input_order else _sort_chunks_by_reading_order(chunks)
+    terms = {t for t in query_terms if len(t) >= 2}
+    if not terms:
+        return ""
+    parts: List[str] = []
+    total = 0
+    for c in ordered:
+        raw_lines = [ln for ln in str(c.get("text") or "").splitlines() if ln.strip()]
+        focused_lines = [
+            ln.strip()
+            for ln in raw_lines
+            if not line_looks_like_toc_leader(ln.strip()) and _line_matches_any_query_term(ln, terms)
+        ]
+        block_src = focused_lines
+        if not block_src:
+            block_src = [
+                ln.strip()
+                for ln in raw_lines
+                if ln.strip() and not line_looks_like_toc_leader(ln.strip())
+            ]
+        block = _clean_extractive_sentence(" ".join(block_src)).strip(" -•*")
+        if not block:
+            continue
+        add = len(block) + (1 if parts else 0)
+        if parts and total + add > max_chars:
+            room = max_chars - total - 1
+            if room > 120:
+                block = block[:room].rsplit(" ", 1)[0].rstrip(",;:") + " …"
+                parts.append(block)
+            break
+        parts.append(block)
+        total += add
+    return " ".join(parts).strip()
+
+
+def _strict_verbatim_top_chunks(chunks: List[Dict[str, Any]], *, max_chars: int) -> str:
+    """Last-resort verbatim excerpt from the highest-ranked context chunks (still handbook-only)."""
+    if not chunks or max_chars < 80:
+        return ""
+    parts: List[str] = []
+    for c in chunks[:5]:
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        lines = [
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip() and not line_looks_like_toc_leader(ln.strip())
+        ]
+        block = _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        if not block:
+            continue
+        if len(block) < 200 and _is_extractive_noise_sentence(block):
+            continue
+        joined = " ".join(parts + [block])
+        if len(joined) > max_chars:
+            room = max_chars - len(" ".join(parts)) - (1 if parts else 0)
+            if room < 100:
+                break
+            block = block[:room].rsplit(" ", 1)[0].rstrip(",;:") + " …"
+        parts.append(block)
+        if len(" ".join(parts)) >= max_chars:
+            break
+    return " ".join(parts).strip()
+
+
+def _is_extractive_noise_sentence(s: str) -> bool:
+    """Filter table-of-contents lines, dot leaders, and other non-prose fragments."""
+    if not s:
+        return True
+    t = s.strip()
+    if len(t) < 22:
+        return True
+    if re.search(r"\.{4,}", t):
+        return True
+    letters = sum(c.isalpha() for c in t)
+    if letters < 14:
+        return True
+    dots = t.count(".")
+    if dots >= 6 and letters > 0 and dots > letters * 0.35:
+        return True
+
+    # Treat short, title-like lines with mostly capitalized words and no clear
+    # verb as headings, not answer content (e.g. "Employee Referral Policy",
+    # "Duration of Employment Referral Amount").
+    if not any(ch in t for ch in ".!?"):
+        # Remove obvious trailing punctuation like ":" for heuristic checks.
+        core = re.sub(r"[:\-–]+$", "", t).strip()
+        words = core.split()
+        if 2 <= len(words) <= 8:
+            title_like = sum(1 for w in words if w[:1].isupper())
+            lower_like = sum(1 for w in words if w.islower())
+            if title_like >= max(2, len(words) - 1) and lower_like <= 1:
+                # Also ensure we don't accidentally drop imperative/verb phrases.
+                verb_markers = {"is", "are", "was", "were", "must", "should", "shall", "may", "can", "could", "will"}
+                if not any(v in core.lower().split() for v in verb_markers):
+                    return True
+
+    return False
+
+
+def _clean_extractive_sentence(s: str) -> str:
+    t = re.sub(r"\.{3,}", " ", s)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _section_label_plausible_for_chunk(sec: str, chunk_text: str) -> bool:
+    """
+    Trust ingestion-provided source_section unless it clearly comes from a TOC line.
+
+    Handbook chunks often store the heading only in payload; the body does not repeat
+    it, so we must not require a substring match (that incorrectly forced "Unknown").
+    """
+    sec = (sec or "").strip()
+    if not sec:
+        return False
+    if re.search(r"\.{4,}", sec):
+        return False
+    chunk_text = chunk_text or ""
+    sec_l = sec.lower()
+    found_on_clean = False
+    found_on_toc = False
+    for ln in chunk_text.splitlines():
+        st = ln.strip()
+        if not st:
+            continue
+        if sec not in st and sec_l not in st.lower():
+            continue
+        if re.search(r"\.{4,}", st):
+            found_on_toc = True
+        else:
+            found_on_clean = True
+    if found_on_clean:
+        return True
+    if found_on_toc:
+        return False
+    # Section label not repeated in body — normal for SOURCE_SECTION / auto-structured ingest.
+    return True
+
+
+_VOWEL_CHARS = frozenset("aeiouy")
+
+
+def _is_obvious_gibberish_query(query: str) -> bool:
+    """
+    Cheap, high-precision filter for random keyboard noise (e.g. 'nfbhgbgh').
+    Runs before embeddings/Qdrant so retrieval is not wasted. Does not use the
+    old HR typo whitelist — only structural / vowel heuristics.
+    """
+    raw = (query or "").strip()
+    if not raw:
+        return False
+
+    letters_only = re.sub(r"[^a-zA-Z]", "", raw)
+    letters_low = letters_only.lower()
+
+    if not letters_low:
+        compact = re.sub(r"\s+", "", raw)
+        return len(compact) >= 4
+
+    if len(letters_low) >= 4 and not any(c in _VOWEL_CHARS for c in letters_low):
+        return True
+
+    if len(letters_low) >= 12:
+        vc = sum(1 for c in letters_low if c in _VOWEL_CHARS)
+        ratio = vc / len(letters_low)
+        if vc == 0 or ratio < 0.1:
+            return True
+
+    if re.search(r"(.)\1{4,}", letters_low):
+        return True
+
+    return False
 
 
 def _is_probably_gibberish(query: str) -> bool:
     """
-    Conservative gibberish detector to avoid answering nonsense with unrelated policy text.
+    Optional pre-RAG filter (see RAG_ENABLE_GIBBERISH_FILTER; default off).
+    Previously ran for every query and returned UNKNOWN without hitting embeddings/Qdrant/LLM
+    whenever no word matched a tiny HR typo list — causing many false "document doesn't mention".
     """
+    if not getattr(settings, "RAG_ENABLE_GIBBERISH_FILTER", False):
+        return False
+
     q = _sanitize_query(query)
     if not q:
+        return False
+
+    q_low = q.lower()
+    if re.search(
+        r"\b(what|when|where|who|why|how|which|whose|whom|tell|explain|describe|define|list|name|"
+        r"is|are|was|were|does|did|do|can|could|should|must|may|will|would|about|regarding)\b",
+        q_low,
+    ):
         return False
 
     tokens = [t.lower() for t in re.findall(r"[a-zA-Z]+", q)]
@@ -345,19 +880,21 @@ def _is_probably_gibberish(query: str) -> bool:
     if not meaningful:
         return False
 
+    _canonical_sorted = sorted(_TYPO_CANONICAL_TERMS)
+
     def known_like(tok: str) -> bool:
         if tok in _TYPO_CANONICAL_TERMS:
             return True
-        return bool(difflib.get_close_matches(tok, _TYPO_CANONICAL_TERMS, n=1, cutoff=0.84))
+        return bool(difflib.get_close_matches(tok, _canonical_sorted, n=1, cutoff=0.84))
 
     known_count = sum(1 for t in meaningful if known_like(t))
     if known_count > 0:
         return False
 
-    # If all meaningful tokens are unknown and at least one is long/noisy, treat as gibberish.
-    noisy_long = any(len(t) >= 8 for t in meaningful)
+    vowel_re = re.compile(r"[aeiou]", re.I)
+    no_vowel_word = any(len(t) >= 5 and not vowel_re.search(t) for t in meaningful)
     repeated_noise = any(re.search(r"(.)\1\1", t) for t in meaningful)
-    return noisy_long or repeated_noise
+    return no_vowel_word or repeated_noise
 
 
 def _rerank_by_query_overlap(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -366,94 +903,199 @@ def _rerank_by_query_overlap(query: str, items: List[Dict[str, Any]]) -> List[Di
     This improves precision for policy-style questions where exact phrasing matters.
     """
     q_terms = _tokenize_keywords(query)
-    anchors = _anchor_terms(query)
+    rterms = _retrieval_terms(query)
     if not q_terms:
         return items
 
-    def rank_key(item: Dict[str, Any]) -> tuple[int, int, int, float]:
+    def rank_key(item: Dict[str, Any]) -> tuple[int, int, int, int, int, float, float, float]:
         payload = item.get("payload") or {}
         text = str(payload.get("text") or "")
+        section = str(payload.get("source_section") or "")
+
         text_terms = _tokenize_keywords(text)
+        sec_terms = _tokenize_keywords(section)
+
         overlap = len(q_terms.intersection(text_terms))
-        anchor_overlap = len(anchors.intersection(text_terms))
-        phrase_hits = sum(1 for a in anchors if a in text.lower())
+        anchor_overlap = len(rterms.intersection(text_terms))
+
+        sec_overlap = len(q_terms.intersection(sec_terms))
+        sec_anchor_overlap = len(rterms.intersection(sec_terms))
+
+        phrase_hits = sum(1 for a in rterms if a in text.lower() or a in section.lower())
+        rrf = float(item.get("_rrf") or 0.0)
+        bm25 = float(item.get("_bm25") or 0.0)
         score = float(item.get("score") or 0.0)
-        return (anchor_overlap, overlap, phrase_hits, score)
+        # Prefer chunks whose section title itself matches the query (e.g. "Reimbursement Policy")
+        return (
+            sec_anchor_overlap,
+            anchor_overlap,
+            sec_overlap,
+            overlap,
+            phrase_hits,
+            rrf,
+            bm25,
+            score,
+        )
 
     return sorted(items, key=rank_key, reverse=True)
 
 
-def _max_overlap(query: str, items: List[Dict[str, Any]]) -> int:
-    anchors = _anchor_terms(query)
-    if not anchors:
-        return 0
-    best = 0
-    for item in items:
-        payload = item.get("payload") or {}
-        text = str(payload.get("text") or "")
-        overlap = len(anchors.intersection(_tokenize_keywords(text)))
-        if overlap > best:
-            best = overlap
-    return best
+def _payload_from_scanned_point(p: Any) -> Optional[Dict[str, Any]]:
+    if p is None:
+        return None
+    return p.payload if hasattr(p, "payload") else p.get("payload")
 
 
-def _augment_with_lexical_candidates(
+def _retrieved_chunk_id(item: Dict[str, Any]) -> str:
+    pl = item.get("payload") or {}
+    return str(pl.get("chunk_id") or "")
+
+
+def _first_rank_maps(
+    items: List[Dict[str, Any]],
+) -> tuple[Dict[str, int], Dict[str, Dict[str, Any]]]:
+    rank: Dict[str, int] = {}
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for r, item in enumerate(items):
+        k = _retrieved_chunk_id(item)
+        if not k or k in rank:
+            continue
+        rank[k] = r
+        by_id[k] = item
+    return rank, by_id
+
+
+def _lexical_candidates_bm25(
     *,
     query: str,
-    retrieved: List[Dict[str, Any]],
-    qdrant: QdrantService,
-    top_k: int,
+    scanned_points: List[Any],
+    top_n: int,
 ) -> List[Dict[str, Any]]:
     """
-    Hybrid fallback: when semantic recall misses exact policy phrasing,
-    scan payload text and inject high-overlap chunks.
+    Keyword channel: BM25 over scrolled payloads using tokens derived from the query only.
     """
-    anchors = _anchor_terms(query)
-    if not anchors:
-        return retrieved
+    keywords = list(_retrieval_terms(query))
+    if not keywords or not scanned_points:
+        return []
 
-    # Skip expensive scroll when semantic hits already cover query anchors.
-    mo = _max_overlap(query, retrieved)
-    need = 1 if len(anchors) == 1 else min(2, len(anchors))
-    if mo >= need:
-        return retrieved
-
-    scan_cap = int(getattr(settings, "RAG_LEXICAL_SCAN_LIMIT", 150))
-    scanned = qdrant.scan_payload_points(limit=max(min(scan_cap, top_k * 25), 80))
-    lexical_candidates: List[Dict[str, Any]] = []
-    for p in scanned:
-        payload = p.payload if hasattr(p, "payload") else p.get("payload")
+    rows: List[tuple[str, str, Dict[str, Any]]] = []
+    for p in scanned_points:
+        payload = _payload_from_scanned_point(p)
         if not payload or not payload.get("text"):
             continue
-        text_terms = _tokenize_keywords(str(payload.get("text") or ""))
-        overlap = len(anchors.intersection(text_terms))
+        text = str(payload.get("text") or "")
+        sec = str(payload.get("source_section") or "")
+        rows.append((text, sec, payload))
+
+    if not rows:
+        return []
+
+    docs = [(t, s) for t, s, _ in rows]
+    scores = _bm25_score_documents(docs, keywords)
+
+    out: List[Dict[str, Any]] = []
+    for idx, (text, sec, payload) in enumerate(rows):
+        blob = f"{text} {sec}".lower()
+        overlap = 0
+        for kw in keywords:
+            pat = rf"(?<!\w){re.escape(kw)}(?!\w)"
+            if re.search(pat, blob, flags=re.IGNORECASE):
+                overlap += 1
         if overlap <= 0:
             continue
-        lexical_candidates.append(
+        out.append(
             {
-                # Give lexical candidates a non-zero score so they can survive thresholding.
-                "score": 0.15 + (0.05 * overlap),
+                "score": None,
                 "payload": payload,
                 "_lexical": True,
+                "_bm25": float(scores[idx]),
                 "_overlap": overlap,
             }
         )
 
-    lexical_ranked = _rerank_by_query_overlap(query, lexical_candidates)
-    boosted = lexical_ranked[: max(top_k * 8, 40)]
+    out.sort(key=lambda x: (-float(x["_bm25"]), -int(x["_overlap"])))
+    return out[:top_n]
 
-    seen = {
-        (r.get("payload") or {}).get("chunk_id")
-        for r in retrieved
-        if (r.get("payload") or {}).get("chunk_id") is not None
-    }
-    merged = list(retrieved)
-    for c in boosted:
-        chunk_id = (c.get("payload") or {}).get("chunk_id")
-        if chunk_id is not None and chunk_id in seen:
-            continue
-        merged.append(c)
+
+def _hybrid_reciprocal_rank_fuse(
+    semantic: List[Dict[str, Any]],
+    lexical: List[Dict[str, Any]],
+    *,
+    rrf_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Merge dense (semantic) and BM25 (lexical) ranked lists with reciprocal rank fusion.
+    """
+    sem_rank, sem_by = _first_rank_maps(semantic)
+    lex_rank, lex_by = _first_rank_maps(lexical)
+    all_keys = set(sem_rank) | set(lex_rank)
+    merged: List[Dict[str, Any]] = []
+
+    for key in all_keys:
+        rrf_score = 0.0
+        if key in sem_rank:
+            rrf_score += 1.0 / (rrf_k + sem_rank[key] + 1)
+        if key in lex_rank:
+            rrf_score += 1.0 / (rrf_k + lex_rank[key] + 1)
+
+        if key in sem_by:
+            base = dict(sem_by[key])
+        else:
+            lx = lex_by[key]
+            base = {
+                "score": None,
+                "payload": lx.get("payload"),
+                "_lexical": True,
+                "_bm25": float(lx.get("_bm25") or 0),
+                "_overlap": int(lx.get("_overlap") or 0),
+            }
+
+        if key in lex_by:
+            lx = lex_by[key]
+            base["_bm25"] = max(float(base.get("_bm25") or 0), float(lx.get("_bm25") or 0))
+            base["_overlap"] = max(int(base.get("_overlap") or 0), int(lx.get("_overlap") or 0))
+            base["_lexical"] = bool(base.get("_lexical")) or bool(lx.get("_lexical"))
+        else:
+            base.setdefault("_bm25", 0.0)
+            base.setdefault("_overlap", 0)
+
+        base["_rrf"] = rrf_score
+        merged.append(base)
+
+    merged.sort(key=lambda x: -float(x.get("_rrf", 0.0)))
     return merged
+
+
+def _hybrid_merge_semantic_and_lexical(
+    *,
+    query: str,
+    qdrant: QdrantService,
+    semantic_items: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Always runs the lexical channel when the query yields keywords and Qdrant scroll is
+    available; fuses with semantic hits via RRF so both signals contribute every time.
+    """
+    lexical_items: List[Dict[str, Any]] = []
+    keywords = _retrieval_terms(query)
+    scan_fn = getattr(qdrant, "scan_payload_points", None)
+    if keywords and callable(scan_fn):
+        per_page = int(getattr(settings, "RAG_LEXICAL_SCAN_LIMIT", 150))
+        max_points = int(getattr(settings, "RAG_LEXICAL_MAX_POINTS", 400))
+        try:
+            scanned = scan_fn(limit=per_page, max_points=max_points)
+        except Exception:
+            scanned = []
+        lexical_top = max(top_k * 6, 36)
+        lexical_items = _lexical_candidates_bm25(
+            query=query,
+            scanned_points=scanned or [],
+            top_n=lexical_top,
+        )
+
+    rrf_k = int(getattr(settings, "RAG_HYBRID_RRF_K", 60))
+    return _hybrid_reciprocal_rank_fuse(semantic_items, lexical_items, rrf_k=rrf_k)
 
 
 def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str, Any]]) -> str:
@@ -476,6 +1118,8 @@ def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str
             sentence = p.strip()
             if len(sentence) < 20:
                 continue
+            if _is_extractive_noise_sentence(sentence):
+                continue
             overlap = len(q_terms.intersection(_tokenize_keywords(sentence)))
             if overlap > 0:
                 candidates.append((overlap, sentence))
@@ -487,87 +1131,21 @@ def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str
     top = []
     seen = set()
     for _, sentence in candidates:
-        key = sentence.lower()
+        cleaned = _clean_extractive_sentence(sentence)
+        if _is_extractive_noise_sentence(cleaned):
+            continue
+        key = cleaned.lower()
         if key in seen:
             continue
         seen.add(key)
-        top.append(sentence)
-        if len(top) >= 4:
+        top.append(cleaned)
+        cap = int(getattr(settings, "RAG_STRICT_EXTRACTIVE_MAX_BULLETS", 10))
+        if len(top) >= cap:
             break
 
     if not top:
         return ""
     return "Based on the policy:\n- " + "\n- ".join(top)
-
-
-def _extract_page_number(text: str) -> Optional[int]:
-    """
-    Extracts a page number only when it's explicitly present in the chunk text.
-    """
-    if not text:
-        return None
-    m = re.search(r"\bpage\s*[:#]?\s*(\d{1,5})\b", text, flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def _extract_section_title(text: str) -> Optional[str]:
-    """
-    Extracts a section title only using explicit nearby formatting in the chunk.
-    Falls back to None when the title can't be identified reliably.
-    """
-    if not text:
-        return None
-
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not lines:
-        return None
-
-    page_idx = None
-    page_re = re.compile(r"\bpage\s*[:#]?\s*(\d{1,5})\b", flags=re.IGNORECASE)
-    for i, ln in enumerate(lines):
-        if page_re.search(ln):
-            page_idx = i
-            break
-
-    if page_idx is not None and page_idx > 0:
-        # Heuristic: the line immediately before an explicit "Page X" is often the section title.
-        candidate = lines[page_idx - 1]
-        if 3 <= len(candidate) <= 120 and not candidate.lower().startswith("page"):
-            # Avoid sentence-like lines.
-            if not candidate.endswith("."):
-                return candidate
-
-    # Section-number style headings (e.g. "3.6 small", "14.7 Purpose", "14.12 Payment Method").
-    m = re.search(
-        r"\b(\d+(?:\.\d+)+)\s+([A-Za-z][^\n]{0,80})",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        num = m.group(1).strip()
-        title_tail = m.group(2).strip()
-        # Keep it short and avoid trailing sentence fragments.
-        title_tail = re.sub(r"[,:;\.].*$", "", title_tail).strip()
-        if title_tail:
-            return f"{num} {title_tail}".strip()
-
-    # Also support explicit patterns like "Section: Employee Wellness Benefits".
-    m = re.search(
-        r"\b(?:section|policy|chapter)\s*[:\-]\s*([^\n]{3,120})",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        candidate = m.group(1).strip()
-        if candidate and 3 <= len(candidate) <= 120:
-            return candidate
-
-    return None
 
 
 def _extractive_answer_with_sources_from_context(
@@ -576,164 +1154,143 @@ def _extractive_answer_with_sources_from_context(
     *,
     max_sentences: int = 4,
     query_embedding: Optional[List[float]] = None,
+    force_lexical_sentence_ranking: bool = False,
 ) -> tuple[str, List[Dict[str, Any]]]:
     """
     Strict, non-hallucinating mode:
-    - Selects verbatim sentences from retrieved chunks.
-    - Includes "Source section" and "Page" only if explicitly detectable in the chunk text.
+    - Selects verbatim sentences from retrieved chunks (skips TOC / dot-leader lines).
+    - Prefers sentences from higher-ranked context chunks before mixing in lower chunks.
+    - Source section / page come from payload only when the section label is not TOC-only.
+    When force_lexical_sentence_ranking is True (e.g. embedding API unavailable), ranks
+    sentences by anchor overlap only — no embedding calls.
     Returns (answer_text, used_context_chunks).
     """
-    # Use anchor terms for relevance (not just any tokens), so intent/meta words
-    # like "tell/explain/how" and generic words like "policy/rules" don't trigger
-    # sentence selection for unrelated queries.
-    q_terms = _anchor_terms(question)
+    _ = (query_embedding, force_lexical_sentence_ranking, max_sentences)
+
+    # Match questions to chunks using broad retrieval terms (includes policy,
+    # employee, reimbursement, etc.). Anchor-only matching was too strict and
+    # caused false "document doesn't mention it" for normal handbook questions.
+    q_terms = set(_retrieval_terms(question))
+    if not q_terms:
+        q_terms = _tokenize_keywords(question)
     if not q_terms:
         return "", []
 
-    # Require a bit more overlap when the question contains many anchor terms.
-    # This reduces "random single-word matches" that can otherwise return
-    # unrelated sentences for illogical inputs.
     min_overlap = int(getattr(settings, "RAG_STRICT_MIN_SENTENCE_OVERLAP", 1))
-    if len(q_terms) >= 4:
+    if len(q_terms) >= 8:
         min_overlap = max(min_overlap, 2)
 
-    sentences_per_chunk = int(getattr(settings, "RAG_STRICT_SENTENCES_PER_CHUNK", 6))
-    max_candidate_sentences = int(getattr(settings, "RAG_STRICT_MAX_CANDIDATE_SENTENCES", 30))
+    max_chunks_for_body = int(getattr(settings, "RAG_STRICT_MAX_CHUNKS_FOR_BODY", 12))
+    chunk_order: Dict[str, int] = {}
+    for i, c in enumerate(context_chunks):
+        cid = str(c.get("chunk_id") or "")
+        if cid:
+            chunk_order[cid] = i
 
-    # Candidate extraction: still verbatim sentences, but we may choose them semantically.
-    candidates: List[tuple[float, int, str, Dict[str, Any]]] = []  # (overlap, sentence_len, sentence, chunk_meta)
-    for c in context_chunks:
-        text = str(c.get("text") or "")
-        if not text:
+    chunk_scored = _strict_chunk_scores(
+        context_chunks,
+        q_terms=q_terms,
+        min_overlap=min_overlap,
+        chunk_order=chunk_order,
+    )
+
+    selected_scored: List[tuple[float, int, Dict[str, Any]]] = []
+    seen_chunk_ids: set[str] = set()
+    for _bm25, ov, _ord, c in chunk_scored:
+        cid = str(c.get("chunk_id") or "")
+        if cid and cid in seen_chunk_ids:
             continue
-        parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text)
-        chunk_candidates: List[tuple[int, int, str]] = []  # (overlap, sentence_len, sentence)
-        for p in parts:
-            sentence = p.strip()
-            if len(sentence) < 20:
-                continue
-            overlap = len(q_terms.intersection(_tokenize_keywords(sentence)))
-            if overlap < min_overlap:
-                continue
-            chunk_candidates.append((overlap, len(sentence), sentence))
-
-        # Keep the best candidates per chunk to control latency.
-        chunk_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        for overlap, sentence_len, sentence in chunk_candidates[:sentences_per_chunk]:
-            candidates.append((float(overlap), sentence_len, sentence, c))
-
-    if not candidates:
-        return "", []
-
-    # Hard cap on candidates to bound embedding cost.
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    candidates = candidates[:max_candidate_sentences]
-
-    # Compute query embedding if not provided.
-    if query_embedding is None:
-        query_embedding = get_embeddings([question])[0]
-
-    q_norm = math.sqrt(sum(v * v for v in (query_embedding or [])))
-
-    sentence_texts = [c[2] for c in candidates]
-    sentence_embeddings = get_embeddings(sentence_texts, batch_size=int(getattr(settings, "EMBEDDING_BATCH_SIZE", 64)))
-
-    # Cosine similarity; if we can't compute norms (e.g., zero vectors), fall back to overlap.
-    sim_threshold = float(getattr(settings, "RAG_STRICT_SENTENCE_SIM_THRESHOLD", 0.15))
-
-    scored: List[tuple[float, int, str, Dict[str, Any]]] = []
-    for (overlap, sentence_len, sentence, chunk_meta), sent_emb in zip(candidates, sentence_embeddings):
-        s_norm = math.sqrt(sum(v * v for v in (sent_emb or [])))
-        if not q_norm or not s_norm:
-            similarity = float(overlap)
-        else:
-            dot = sum(qe * se for qe, se in zip(query_embedding, sent_emb))
-            similarity = dot / (q_norm * s_norm)
-        scored.append((similarity, sentence_len, sentence, chunk_meta))
-
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    selected_sentences: List[str] = []
-    selected_sentence_keys: set[str] = set()
-    selected_chunks: List[Dict[str, Any]] = []
-    selected_chunk_ids: set[str] = set()
-
-    # First pass: similarity threshold.
-    for sim, _, sentence, chunk_meta in scored:
-        if sim < sim_threshold:
-            continue
-        key = sentence.lower()
-        if key in selected_sentence_keys:
-            continue
-        selected_sentence_keys.add(key)
-        selected_sentences.append(sentence)
-        chunk_id = str(chunk_meta.get("chunk_id") or "")
-        if chunk_id and chunk_id not in selected_chunk_ids:
-            selected_chunk_ids.add(chunk_id)
-            selected_chunks.append(chunk_meta)
-        if len(selected_sentences) >= max_sentences:
+        if cid:
+            seen_chunk_ids.add(cid)
+        selected_scored.append((_bm25, ov, c))
+        if len(selected_scored) >= max_chunks_for_body:
             break
 
-    # If nothing meets the semantic threshold, do not "best-effort" select random
-    # overlapping sentences. In a strict HR bot, returning UNKNOWN is safer.
-    if not selected_sentences:
+    before_bm_trim = list(selected_scored)
+    rel_floor = float(getattr(settings, "RAG_STRICT_BM25_RELATIVE_FLOOR", 0.0))
+    if rel_floor > 0 and len(selected_scored) > 1:
+        top_bm = max((s[0] for s in selected_scored), default=0.0)
+        if top_bm > 1e-9:
+            selected_scored = [s for s in selected_scored if s[0] >= rel_floor * top_bm]
+    if not selected_scored and before_bm_trim:
+        selected_scored = before_bm_trim[:1]
+
+    # Semantic retrieval already ranked these chunks; if keyword overlap fails
+    # (synonyms, phrasing), still answer from the retrieved context verbatim.
+    if not selected_scored and context_chunks:
+        fb = _sort_chunks_by_reading_order(list(context_chunks))[:max_chunks_for_body]
+        selected_scored = [(0.0, 0, c) for c in fb]
+
+    if not selected_scored:
         return "", []
 
-    # Pick section/page from whichever selected chunk actually contains it.
+    # BM25 within context, then overlap, then reading order for ties.
+    selected_scored.sort(
+        key=lambda oc: (-oc[0], -oc[1], _chunk_reading_key(oc[2]))
+    )
+    selected_chunks = [c for _bm25, _ov, c in selected_scored]
+
+    # Source section / page: use Qdrant payload only. If ingestion left them empty,
+    # show Unknown — do not guess from chunk text (that caused "fake" citations vs payload).
     section: Optional[str] = None
     page: Optional[int] = None
     for chunk_meta in selected_chunks:
-        chunk_text = str(chunk_meta.get("text") or "")
-        if section is None:
-            cand = _extract_section_title(chunk_text)
-            if cand:
-                section = cand
-        if page is None:
-            cand_page = _extract_page_number(chunk_text)
-            if cand_page is not None:
-                page = cand_page
+        meta_sec = (chunk_meta.get("source_section") or "").strip()
+        meta_page = chunk_meta.get("page_number")
+        ctext = str(chunk_meta.get("text") or "")
+        if section is None and meta_sec and _section_label_plausible_for_chunk(meta_sec, ctext):
+            section = meta_sec
+        if page is None and meta_page is not None:
+            try:
+                page = int(meta_page)
+            except (TypeError, ValueError):
+                pass
         if section is not None and page is not None:
             break
     section_str = section or "Unknown"
     page_str = str(page) if page is not None else "Unknown"
 
-    # Human-readable intro + answer formatting.
-    q_terms_for_intro = list(_anchor_terms(question))
-    topic_hint = " ".join(q_terms_for_intro[:4]).strip() or "your question"
+    body_char_cap = int(getattr(settings, "RAG_STRICT_ANSWER_BODY_CHARS", 8000))
+    answer_paragraph = ""
+    if getattr(settings, "RAG_STRICT_QUERY_FOCUSED_BODY", True):
+        answer_paragraph = _strict_body_query_focused(
+            selected_chunks,
+            query_terms=q_terms,
+            max_chars=body_char_cap,
+            respect_input_order=True,
+        )
+    min_focus_chars = max(48, min(200, body_char_cap // 40))
+    if len(answer_paragraph.strip()) < min_focus_chars:
+        answer_paragraph = _strict_body_from_chunks_ordered(
+            selected_chunks,
+            max_chars=body_char_cap,
+            respect_input_order=True,
+        )
+    if not answer_paragraph.strip():
+        fb = _extractive_answer_from_context(question, selected_chunks)
+        if fb.strip():
+            answer_paragraph = fb
+    if not answer_paragraph.strip():
+        answer_paragraph = _strict_verbatim_top_chunks(
+            selected_chunks,
+            max_chars=body_char_cap,
+        )
+    if not answer_paragraph.strip():
+        return "", []
 
-    cleaned_sentences: List[str] = []
-    seen_sentence_keys: set[str] = set()
-    for s in selected_sentences:
-        t = re.sub(r"\s+", " ", (s or "").strip())
-        t = t.strip(" -•*")
-        if not t:
-            continue
-        key = t.lower()
-        if key in seen_sentence_keys:
-            continue
-        seen_sentence_keys.add(key)
-        cleaned_sentences.append(t)
-
-    # Keep response concise and readable.
-    answer_paragraph = " ".join(cleaned_sentences[:3]).strip()
     if answer_paragraph and not answer_paragraph.endswith("."):
         answer_paragraph += "."
 
-    answer_lines: List[str] = [
-        f"Here is what I found about {topic_hint}.",
-        "",
-        "### Answer",
-        "",
-        answer_paragraph,
-        "",
-        "### Source Section",
-        section_str,
-        "",
-        "### Page Number",
-        page_str,
-        "",
-        "If you have any further questions, do let me know.",
-    ]
+    answer_lines: List[str] = [answer_paragraph, ""]
+    answer_lines.extend(
+        [
+            "Source section",
+            section_str,
+            "",
+            "Page number",
+            page_str,
+        ]
+    )
 
     return "\n".join(answer_lines).strip(), selected_chunks
 
@@ -743,39 +1300,27 @@ def _should_use_extractive_fallback(question: str, context_chunks: List[Dict[str
     Use extractive fallback only when key terms from the question
     are actually present in retrieved context.
     """
-    anchors = _anchor_terms(question)
-    if not anchors:
+    rterms = _retrieval_terms(question)
+    if not rterms:
         return False
 
     context_terms: set[str] = set()
     for c in context_chunks:
         context_terms |= _tokenize_keywords(str(c.get("text") or ""))
 
-    overlap = len(anchors.intersection(context_terms))
+    overlap = len(rterms.intersection(context_terms))
     return overlap >= 1
 
 
 def _query_is_covered_by_context(question: str, context_chunks: List[Dict[str, Any]]) -> bool:
-    anchors = _anchor_terms(question)
-    if not anchors:
+    rterms = _retrieval_terms(question)
+    if not rterms:
         return False
-    q_lower = question.lower()
-    strict_factoid = any(
-        k in q_lower for k in ("name of", "who is", "who's", "current", "specifically", "exact")
-    )
-
     context_terms: set[str] = set()
     for c in context_chunks:
         context_terms |= _tokenize_keywords(str(c.get("text") or ""))
-    overlap = len(anchors.intersection(context_terms))
-    anchor_count = len(anchors)
-    if strict_factoid:
-        # For specific factoid asks, require full anchor coverage.
-        return overlap == anchor_count
-    if anchor_count == 1:
-        return overlap == 1
-    # Require stronger evidence for multi-term queries to avoid false positives.
-    return overlap >= 2 and (overlap / anchor_count) >= 0.5
+    overlap = len(rterms.intersection(context_terms))
+    return overlap >= 1
 
 
 def _prefer_extractive_for_question(question: str) -> bool:
@@ -795,36 +1340,36 @@ def _manual_pipeline(
     t0 = time.time()
     try:
         sanitized = _sanitize_query(query)
-        query_embedding = get_embeddings([sanitized])[0]
+        query_embedding: Optional[List[float]] = None
+        embedding_failed = False
+        try:
+            query_embedding = get_embeddings([sanitized])[0]
+        except Exception:
+            embedding_failed = True
 
-        # Pull a wider semantic candidate set, then rerank by query overlap.
-        candidate_limit = max(top_k * 8, 40)
-        search_results = qdrant.search(query_embedding, limit=candidate_limit) or []
-
-        # Qdrant score: higher is more similar (depending on distance metric).
         retrieved: List[Dict[str, Any]] = []
-        for r in search_results:
-            score = r.score if hasattr(r, "score") else r.get("score")
-            payload = r.payload if hasattr(r, "payload") else r.get("payload")
-            retrieved.append({"score": score, "payload": payload})
+        if not embedding_failed and query_embedding is not None:
+            # Pull a wider semantic candidate set, then rerank by query overlap.
+            search_results = qdrant.search(query_embedding, limit=_dense_candidate_limit(top_k)) or []
 
-        retrieved = _augment_with_lexical_candidates(
+            # Qdrant score: higher is more similar (depending on distance metric).
+            for r in search_results:
+                score = r.score if hasattr(r, "score") else r.get("score")
+                payload = r.payload if hasattr(r, "payload") else r.get("payload")
+                retrieved.append({"score": score, "payload": payload})
+
+        retrieved = _hybrid_merge_semantic_and_lexical(
             query=sanitized,
-            retrieved=retrieved,
             qdrant=qdrant,
+            semantic_items=retrieved,
             top_k=top_k,
         )
-        filtered = [
-            r
-            for r in retrieved
-            if (
-                r.get("_lexical")
-                or (r.get("score") is not None and r["score"] >= threshold)
-            )
-        ]
-        if not filtered:
-            # Keep lexically-boosted candidates even if they use neutral fallback score.
-            filtered = retrieved[: max(top_k * 4, 20)]
+        filtered = _hybrid_filter_for_context(
+            retrieved,
+            query=sanitized,
+            top_k=top_k,
+            threshold=threshold,
+        )
         filtered = _rerank_by_query_overlap(sanitized, filtered)
 
         context_chunks = _build_context(filtered, max_context_tokens=max_context_tokens)
@@ -840,6 +1385,8 @@ def _manual_pipeline(
                         "chunk_index": (r.get("payload") or {}).get("chunk_index"),
                         "chunk_id": (r.get("payload") or {}).get("chunk_id"),
                         "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
+                        "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
+                        "page_number": (r.get("payload") or {}).get("page_number"),
                     }
                     for r in retrieved
                 ],
@@ -847,6 +1394,7 @@ def _manual_pipeline(
                 "latency_ms": latency_ms,
                 "top_k": top_k,
                 "threshold": threshold,
+                **_pipeline_fields(rag_retrieval_ran=True, pipeline="manual_rag_empty_context"),
             }
 
         if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
@@ -856,8 +1404,23 @@ def _manual_pipeline(
                 context_chunks,
                 max_sentences=max_sentences,
                 query_embedding=query_embedding,
+                force_lexical_sentence_ranking=embedding_failed,
             )
-            if not extracted_answer:
+            if not extracted_answer and getattr(settings, "RAG_STRICT_FALLBACK_TO_LLM", True) and context_chunks:
+                llm_tok = int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024))
+                answer = generate_answer(
+                    question=sanitized,
+                    context_chunks=context_chunks,
+                    fallback_phrase=FALLBACK_PHRASE,
+                    model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
+                    max_output_tokens=llm_tok,
+                    temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
+                    prefer_answer_from_context=True,
+                )
+                if not answer.strip() or answer.strip() == UNKNOWN_POLICY_PHRASE:
+                    answer = UNKNOWN_POLICY_PHRASE
+                    context_chunks = []
+            elif not extracted_answer:
                 answer = UNKNOWN_POLICY_PHRASE
                 context_chunks = []
             else:
@@ -869,8 +1432,8 @@ def _manual_pipeline(
                 context_chunks=context_chunks,
                 fallback_phrase=FALLBACK_PHRASE,
                 model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
-                max_output_tokens=getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 512),
-                temperature=getattr(settings, "OPENROUTER_TEMPERATURE", 0.2),
+                max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
+                temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
             )
             if not _query_is_covered_by_context(sanitized, context_chunks):
                 answer = UNKNOWN_POLICY_PHRASE
@@ -896,6 +1459,7 @@ def _manual_pipeline(
             "latency_ms": latency_ms,
             "top_k": top_k,
             "threshold": threshold,
+            **_pipeline_fields(rag_retrieval_ran=True, pipeline="manual_rag_exception"),
         }
 
     latency_ms = int((time.time() - t0) * 1000)
@@ -910,24 +1474,16 @@ def _manual_pipeline(
                 "chunk_index": (r.get("payload") or {}).get("chunk_index"),
                 "chunk_id": (r.get("payload") or {}).get("chunk_id"),
                 "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
+                "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
+                "page_number": (r.get("payload") or {}).get("page_number"),
             }
             for r in filtered[:top_k]
         ],
-        "citations": [
-            {
-                "doc_id": c.get("doc_id"),
-                "chunk_index": c.get("chunk_index"),
-                "chunk_id": c.get("chunk_id"),
-                "text_preview": _text_preview(c.get("text") or ""),
-                "token_count": c.get("token_count"),
-                "source_section": _extract_section_title(c.get("text") or ""),
-                "page": _extract_page_number(c.get("text") or ""),
-            }
-            for c in context_chunks
-        ],
+        "citations": [_citation_entry(c) for c in context_chunks],
         "latency_ms": latency_ms,
         "top_k": top_k,
         "threshold": threshold,
+        **_pipeline_fields(rag_retrieval_ran=True, pipeline="manual_rag"),
     }
 
 
@@ -947,6 +1503,17 @@ def run_rag_query(
     max_context_tokens = (
         max_context_tokens if max_context_tokens is not None else getattr(settings, "RAG_MAX_CONTEXT_TOKENS", 1600)
     )
+    if _is_obvious_gibberish_query(query):
+        return {
+            "answer": UNKNOWN_POLICY_PHRASE,
+            "fallback_used": True,
+            "retrieved": [],
+            "citations": [],
+            "latency_ms": 0,
+            "top_k": top_k,
+            "threshold": threshold,
+            **_pipeline_fields(rag_retrieval_ran=False, pipeline="obvious_gibberish_short_circuit"),
+        }
     if _is_greeting(query):
         return {
             "answer": _greeting_answer(query),
@@ -956,6 +1523,7 @@ def run_rag_query(
             "latency_ms": 0,
             "top_k": top_k,
             "threshold": threshold,
+            **_pipeline_fields(rag_retrieval_ran=False, pipeline="greeting_short_circuit"),
         }
     if _is_probably_gibberish(query):
         return {
@@ -966,7 +1534,13 @@ def run_rag_query(
             "latency_ms": 0,
             "top_k": top_k,
             "threshold": threshold,
+            **_pipeline_fields(rag_retrieval_ran=False, pipeline="gibberish_short_circuit"),
         }
+
+    # In strict mode (extractive/policy mode), we want more retrieved context
+    # to avoid cutting off part of the rules list.
+    if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
+        max_context_tokens = getattr(settings, "RAG_STRICT_MAX_CONTEXT_TOKENS", max_context_tokens)
 
     try:
         from langgraph.graph import StateGraph, END  # type: ignore
@@ -983,33 +1557,28 @@ def run_rag_query(
 
     def retrieve_node(state: RagState) -> RagState:
         qdrant = QdrantService()
-        candidate_limit = max(top_k * 8, 40)
-        results = qdrant.search(state["query_embedding"], limit=candidate_limit) or []
+        results = qdrant.search(state["query_embedding"], limit=_dense_candidate_limit(top_k)) or []
         retrieved: List[Dict[str, Any]] = []
         for r in results:
             score = r.score if hasattr(r, "score") else r.get("score")
             payload = r.payload if hasattr(r, "payload") else r.get("payload")
             retrieved.append({"score": score, "payload": payload})
-        retrieved = _augment_with_lexical_candidates(
+        retrieved = _hybrid_merge_semantic_and_lexical(
             query=state["query"],
-            retrieved=retrieved,
             qdrant=qdrant,
+            semantic_items=retrieved,
             top_k=top_k,
         )
         return {"retrieved": retrieved}
 
     def filter_context_node(state: RagState) -> RagState:
         retrieved = state.get("retrieved") or []
-        filtered = [
-            r
-            for r in retrieved
-            if (
-                r.get("_lexical")
-                or (r.get("score") is not None and r["score"] >= threshold)
-            )
-        ]
-        if not filtered:
-            filtered = retrieved[: max(top_k * 4, 20)]
+        filtered = _hybrid_filter_for_context(
+            retrieved,
+            query=state["query"],
+            top_k=top_k,
+            threshold=threshold,
+        )
         filtered = _rerank_by_query_overlap(state["query"], filtered)
         context_chunks = _build_context(filtered, max_context_tokens=max_context_tokens)
         if not context_chunks:
@@ -1030,6 +1599,28 @@ def run_rag_query(
                 max_sentences=max_sentences,
                 query_embedding=state.get("query_embedding"),
             )
+            if not extracted_answer and getattr(settings, "RAG_STRICT_FALLBACK_TO_LLM", True) and context_chunks:
+                llm_tok = int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024))
+                answer = generate_answer(
+                    question=question,
+                    context_chunks=context_chunks,
+                    fallback_phrase=FALLBACK_PHRASE,
+                    model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
+                    max_output_tokens=llm_tok,
+                    temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
+                    prefer_answer_from_context=True,
+                )
+                if not answer.strip() or answer.strip() == UNKNOWN_POLICY_PHRASE:
+                    return {
+                        "answer": UNKNOWN_POLICY_PHRASE,
+                        "fallback_used": True,
+                        "context_chunks": [],
+                    }
+                return {
+                    "answer": answer,
+                    "fallback_used": False,
+                    "context_chunks": context_chunks,
+                }
             if not extracted_answer:
                 return {
                     "answer": UNKNOWN_POLICY_PHRASE,
@@ -1047,8 +1638,8 @@ def run_rag_query(
             context_chunks=context_chunks,
             fallback_phrase=FALLBACK_PHRASE,
             model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
-            max_output_tokens=getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 512),
-            temperature=getattr(settings, "OPENROUTER_TEMPERATURE", 0.2),
+            max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
+            temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
         )
         if not _query_is_covered_by_context(question, context_chunks):
             answer = UNKNOWN_POLICY_PHRASE
@@ -1110,23 +1701,15 @@ def run_rag_query(
                 "chunk_index": payload.get("chunk_index"),
                 "chunk_id": payload.get("chunk_id"),
                 "text_preview": _text_preview(payload.get("text") or ""),
+                "source_section": (payload.get("source_section") or "").strip(),
+                "page_number": payload.get("page_number"),
             }
         )
 
-    citations = []
-    for c in (final_state.get("context_chunks") or []):
-        chunk_text = c.get("text") or ""
-        citations.append(
-            {
-                "doc_id": c.get("doc_id"),
-                "chunk_index": c.get("chunk_index"),
-                "chunk_id": c.get("chunk_id"),
-                "text_preview": _text_preview(c.get("text") or ""),
-                "token_count": c.get("token_count"),
-                "source_section": _extract_section_title(chunk_text),
-                "page": _extract_page_number(chunk_text),
-            }
-        )
+    citations = [_citation_entry(c) for c in (final_state.get("context_chunks") or [])]
+
+    fchunks = final_state.get("context_chunks") or []
+    pipeline = "langgraph_rag" if fchunks else "langgraph_empty_context"
 
     return {
         "answer": final_state.get("answer") or FALLBACK_PHRASE,
@@ -1136,5 +1719,6 @@ def run_rag_query(
         "latency_ms": latency_ms,
         "top_k": top_k,
         "threshold": threshold,
+        **_pipeline_fields(rag_retrieval_ran=True, pipeline=pipeline),
     }
 
