@@ -99,6 +99,8 @@ def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
                         "Target roughly 25–40% fewer words than the draft when possible, without losing "
                         "any policy facts, numbers, dates, thresholds, steps, or exceptions.\n"
                         "Merge redundant sentences; drop filler and repetition. Do not add information.\n"
+                        "Every sentence must be grammatically complete: do not start or end with a "
+                        "mid-sentence fragment (no orphaned clauses).\n"
                         "Use plain text only (no * or **). Numbered points are fine when they aid scanning.\n"
                         "Output only the shortened answer — no preamble, title, or 'Sources:' section."
                     ),
@@ -165,6 +167,7 @@ def generate_answer(
             f"Use the exact phrase \"{UNKNOWN_POLICY_PHRASE}\" ONLY when the excerpts do not "
             "contain relevant information for the question at all.\n"
             "Prefer quoting or paraphrasing closely from the excerpts; cite [Chunk N] in Sources.\n"
+            "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
         )
     else:
         system_prompt = (
@@ -177,6 +180,7 @@ def generate_answer(
             "Prefer exact section wording over paraphrased assumptions.\n"
             "Quote or cite section titles when possible.\n"
             "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
+            "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
         )
     prompt = (
         "Context (authoritative):\n"
@@ -188,7 +192,8 @@ def generate_answer(
         "2) Put each point on a new line, and leave one blank line between points.\n"
         "3) Do NOT use markdown symbols such as * or **.\n"
         "4) Do not include unrelated policies or sections — only what answers the question.\n"
-        "5) After the answer, add a `Sources:` section listing which [Chunk N] excerpts you relied on.\n"
+        "5) Every point must be full, grammatically complete sentences — no mid-sentence fragments.\n"
+        "6) After the answer, add a `Sources:` section listing which [Chunk N] excerpts you relied on.\n"
     )
 
     extra_headers = {

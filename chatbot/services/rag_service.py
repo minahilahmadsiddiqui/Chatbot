@@ -646,7 +646,9 @@ def _strict_body_from_chunks_ordered(
             if not ln or line_looks_like_toc_leader(ln):
                 continue
             lines.append(ln)
-        block = _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        block = _filter_to_complete_sentences(
+            _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        )
         if not block:
             continue
         add = len(block) + (1 if parts else 0)
@@ -654,11 +656,13 @@ def _strict_body_from_chunks_ordered(
             room = max_chars - total - 1
             if room > 120:
                 block = block[:room].rsplit(" ", 1)[0].rstrip(",;:") + " …"
+                block = _filter_to_complete_sentences(block) or block
                 parts.append(block)
             break
         parts.append(block)
         total += add
-    return " ".join(parts).strip()
+    joined = " ".join(parts).strip()
+    return _filter_to_complete_sentences(joined) or joined
 
 
 def _line_matches_any_query_term(line: str, terms: set[str]) -> bool:
@@ -687,19 +691,8 @@ def _strict_body_query_focused(
     total = 0
     for c in ordered:
         raw_lines = [ln for ln in str(c.get("text") or "").splitlines() if ln.strip()]
-        focused_lines = [
-            ln.strip()
-            for ln in raw_lines
-            if not line_looks_like_toc_leader(ln.strip()) and _line_matches_any_query_term(ln, terms)
-        ]
-        block_src = focused_lines
-        if not block_src:
-            block_src = [
-                ln.strip()
-                for ln in raw_lines
-                if ln.strip() and not line_looks_like_toc_leader(ln.strip())
-            ]
-        block = _clean_extractive_sentence(" ".join(block_src)).strip(" -•*")
+        block_src = _expand_query_focus_lines(raw_lines, terms)
+        block = _filter_to_complete_sentences(_clean_extractive_sentence(" ".join(block_src)).strip(" -•*"))
         if not block:
             continue
         add = len(block) + (1 if parts else 0)
@@ -728,7 +721,9 @@ def _strict_verbatim_top_chunks(chunks: List[Dict[str, Any]], *, max_chars: int)
             for ln in text.splitlines()
             if ln.strip() and not line_looks_like_toc_leader(ln.strip())
         ]
-        block = _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        block = _filter_to_complete_sentences(
+            _clean_extractive_sentence(" ".join(lines)).strip(" -•*")
+        )
         if not block:
             continue
         if len(block) < 200 and _is_extractive_noise_sentence(block):
@@ -783,6 +778,96 @@ def _is_extractive_noise_sentence(s: str) -> bool:
 def _clean_extractive_sentence(s: str) -> str:
     t = re.sub(r"\.{3,}", " ", s)
     return re.sub(r"\s+", " ", t).strip()
+
+
+_INCOMPLETE_TAIL_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "of",
+        "to",
+        "for",
+        "and",
+        "or",
+        "that",
+        "which",
+        "whose",
+        "by",
+        "on",
+        "in",
+        "as",
+        "at",
+        "is",
+        "are",
+        "be",
+        "been",
+        "was",
+        "were",
+        "defines",
+        "define",
+        "including",
+        "such",
+        "from",
+        "with",
+        "into",
+        "all",
+        "any",
+        "each",
+        "every",
+        "their",
+        "our",
+        "your",
+        "this",
+        "these",
+        "those",
+    }
+)
+
+
+def _filter_to_complete_sentences(text: str) -> str:
+    """
+    Drop mid-sentence leading fragments and trailing clauses that end on function words
+    without terminal punctuation (common when lines are stitched from PDFs).
+    """
+    t = _clean_extractive_sentence(text)
+    if not t:
+        return t
+    segments = re.split(r"(?<=[.!?])\s+", t)
+    kept: List[str] = []
+    for seg in segments:
+        s = seg.strip()
+        if not s or len(s) < 18:
+            continue
+        if s[0].isalpha() and s[0].islower():
+            continue
+        terminal = s[-1] in ".!?\"'"
+        if not terminal:
+            parts = s.split()
+            if parts:
+                tail = parts[-1].lower().rstrip(".,;:'\"")
+                if tail in _INCOMPLETE_TAIL_WORDS:
+                    continue
+        kept.append(s)
+    return " ".join(kept) if kept else t
+
+
+def _expand_query_focus_lines(raw_lines: List[str], terms: set[str]) -> List[str]:
+    """
+    When some lines match query terms, include the full contiguous block from the first
+    through the last matching line (and non-empty lines in between) so we do not splice
+    isolated mid-paragraph lines into half-sentences.
+    """
+    cleaned = [ln.strip() for ln in raw_lines if ln.strip()]
+    cleaned = [ln for ln in cleaned if not line_looks_like_toc_leader(ln)]
+    if not cleaned:
+        return []
+    match = [_line_matches_any_query_term(ln, terms) for ln in cleaned]
+    if not any(match):
+        return cleaned
+    first = min(i for i, m in enumerate(match) if m)
+    last = max(i for i, m in enumerate(match) if m)
+    return cleaned[first : last + 1]
 
 
 def _section_label_plausible_for_chunk(sec: str, chunk_text: str) -> bool:
@@ -1107,30 +1192,33 @@ def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str
     if not q_terms:
         return ""
 
-    candidates: List[tuple[int, str]] = []
-    for c in context_chunks:
+    ordered_chunks = _sort_chunks_by_reading_order(list(context_chunks))
+    candidates: List[tuple[int, int, int, str]] = []
+    for ck_idx, c in enumerate(ordered_chunks):
         text = str(c.get("text") or "")
         if not text:
             continue
-        # Coarse sentence split works well enough for policy prose.
         parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text)
-        for p in parts:
+        for pos, p in enumerate(parts):
             sentence = p.strip()
             if len(sentence) < 20:
                 continue
             if _is_extractive_noise_sentence(sentence):
                 continue
+            if sentence[0].isalpha() and sentence[0].islower():
+                continue
             overlap = len(q_terms.intersection(_tokenize_keywords(sentence)))
             if overlap > 0:
-                candidates.append((overlap, sentence))
+                candidates.append((ck_idx, pos, overlap, sentence))
 
     if not candidates:
         return ""
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    # Reading order first, then overlap — avoids shuffled half-thoughts from score-only sorting.
+    candidates.sort(key=lambda x: (x[0], x[1], -x[2]))
     top = []
     seen = set()
-    for _, sentence in candidates:
+    for _ci, _pos, _ov, sentence in candidates:
         cleaned = _clean_extractive_sentence(sentence)
         if _is_extractive_noise_sentence(cleaned):
             continue
@@ -1277,6 +1365,11 @@ def _extractive_answer_with_sources_from_context(
         )
     if not answer_paragraph.strip():
         return "", []
+
+    ap_stripped = answer_paragraph.strip()
+    ap_filtered = _filter_to_complete_sentences(ap_stripped)
+    if ap_filtered.strip():
+        answer_paragraph = ap_filtered
 
     if answer_paragraph and not answer_paragraph.endswith("."):
         answer_paragraph += "."
