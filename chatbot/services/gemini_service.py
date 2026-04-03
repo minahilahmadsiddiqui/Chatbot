@@ -62,6 +62,64 @@ def _beautify_answer(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _strip_trailing_sources_block(text: str) -> str:
+    """Remove model-written Sources section so summarization targets the answer body only."""
+    t = (text or "").rstrip()
+    m = re.search(r"\n(?i)Sources:\s*\n[\s\S]*\Z", t)
+    if m:
+        return t[: m.start()].rstrip()
+    return t
+
+
+def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
+    """
+    Second LLM call: produce a shorter version of the answer while keeping the same facts.
+    """
+    if not draft_body.strip() or draft_body.strip() == UNKNOWN_POLICY_PHRASE:
+        return draft_body
+
+    _sm = getattr(settings, "OPENROUTER_SUMMARY_MODEL", None)
+    model = (str(_sm).strip() if _sm else "") or getattr(
+        settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"
+    )
+    max_out = int(getattr(settings, "OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS", 384))
+    client = _openrouter_client()
+    extra_headers = {
+        "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
+        "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
+    }
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You shorten handbook assistant replies for a chat UI.\n"
+                        "Target roughly 25–40% fewer words than the draft when possible, without losing "
+                        "any policy facts, numbers, dates, thresholds, steps, or exceptions.\n"
+                        "Merge redundant sentences; drop filler and repetition. Do not add information.\n"
+                        "Use plain text only (no * or **). Numbered points are fine when they aid scanning.\n"
+                        "Output only the shortened answer — no preamble, title, or 'Sources:' section."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"User question:\n{question}\n\nDraft answer:\n{draft_body}",
+                },
+            ],
+            temperature=0.08,
+            max_tokens=max_out,
+            extra_headers=extra_headers,
+        )
+        shorter = (response.choices[0].message.content or "").strip()
+        if len(shorter) < 12:
+            return draft_body
+        return shorter
+    except Exception:
+        return draft_body
+
+
 def generate_answer(
     *,
     question: str,
@@ -93,6 +151,7 @@ def generate_answer(
     concise = (
         "Be concise: answer only what the question asks; omit unrelated policies, examples, "
         "and background that does not directly address the question.\n"
+        "Prefer a tight summary over long quotations; include full detail only where the question requires it.\n"
     )
 
     if prefer_answer_from_context:
@@ -176,7 +235,19 @@ def generate_answer(
 
     if not content:
         return UNKNOWN_POLICY_PHRASE
-    return _beautify_answer(content)
+    out = _beautify_answer(content)
+    if out.strip() == UNKNOWN_POLICY_PHRASE:
+        return out
+    if getattr(settings, "RAG_LLM_POST_SUMMARY", True):
+        min_chars = int(getattr(settings, "RAG_SUMMARIZE_MIN_INPUT_CHARS", 200))
+        if len(out) >= min_chars:
+            body = _strip_trailing_sources_block(out)
+            if len(body.strip()) < 20:
+                body = out
+            summarized = summarize_llm_answer_for_display(question=question, draft_body=body)
+            if summarized.strip():
+                out = summarized.strip()
+    return out
 
 
 # Backwards-compatible alias for existing imports.

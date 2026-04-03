@@ -38,6 +38,18 @@ OPENROUTER_HTTP_TIMEOUT_SEC = float(os.getenv("OPENROUTER_HTTP_TIMEOUT_SEC", "12
 OPENROUTER_EMBEDDING_TIMEOUT_SEC = float(os.getenv("OPENROUTER_EMBEDDING_TIMEOUT_SEC", "180"))
 OPENROUTER_EMBEDDING_MAX_RETRIES = int(os.getenv("OPENROUTER_EMBEDDING_MAX_RETRIES", "6"))
 OPENROUTER_MAX_CONTINUATIONS = int(os.getenv("OPENROUTER_MAX_CONTINUATIONS", "1"))
+# Optional second pass: shorten the chat model's answer (same or separate model).
+OPENROUTER_SUMMARY_MODEL = os.getenv("OPENROUTER_SUMMARY_MODEL", "").strip() or None
+OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS", "384"))
+RAG_LLM_POST_SUMMARY = os.getenv("RAG_LLM_POST_SUMMARY", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
+# Only run the summary pass when the beautified answer is at least this long (characters).
+RAG_SUMMARIZE_MIN_INPUT_CHARS = int(os.getenv("RAG_SUMMARIZE_MIN_INPUT_CHARS", "200"))
 
 # RAG defaults
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
