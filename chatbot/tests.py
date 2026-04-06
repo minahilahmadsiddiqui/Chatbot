@@ -8,6 +8,7 @@ from django.test import SimpleTestCase, override_settings
 from chatbot.services.rag_service import (
     UNKNOWN_POLICY_PHRASE,
     run_rag_query,
+    _extractive_answer_with_sources_from_context,
     _sanitize_query,
     _section_label_plausible_for_chunk,
 )
@@ -268,20 +269,41 @@ class RagServiceTests(SimpleTestCase):
         with patch("chatbot.services.rag_service.QdrantService", return_value=DummyQdrant()):
             result = run_rag_query(query="What do employees wear?", top_k=1, threshold=0.5, max_context_tokens=200)
 
-        # Strict mode should build the answer from verbatim retrieved text.
-        assert result["answer"] == (
-            "Employee handbook says you must wear a badge.\n"
-            "\n"
-            "Source section\n"
-            "Unknown\n"
-            "\n"
-            "Page number\n"
-            "Unknown"
-        )
+        # Strict mode should return answer body only; metadata is appended in formatter layer.
+        assert result["answer"] == "Employee handbook says you must wear a badge."
         assert result["fallback_used"] is False
         assert len(result["citations"]) == 1
         assert result["citations"][0]["chunk_id"] == "1_0"
         mock_answer.assert_not_called()
+
+    def test_strict_extractive_hajj_omits_weak_only_lines(self) -> None:
+        """Weak query hits (e.g. 'allowed' alone) must not pull unrelated handbook lines."""
+        chunk = {
+            "text": (
+                "8.10 Hajj Leaves\n"
+                "All Muslim employees shall be entitled to fifteen (15) paid leaves to fulfill "
+                "their obligation of performing Hajj, once during their service.\n"
+                "• Salaries are proportional to efficiency, not to how many people work in your company.\n"
+                "Limited use of cell phones at work is allowed for personal reasons."
+            ),
+            "chunk_id": "1_0",
+            "doc_id": 1,
+            "chunk_index": 0,
+            "source_section": "8.10 Hajj",
+            "page_number": 26,
+            "token_count": count_tokens(
+                "All Muslim employees shall be entitled to fifteen (15) paid leaves."
+            ),
+        }
+        body, _used = _extractive_answer_with_sources_from_context(
+            "how many hajj leaves are allowed?",
+            [chunk],
+        )
+        assert body
+        low = body.lower()
+        assert "hajj" in low
+        assert "cell phone" not in low
+        assert "salaries are proportional" not in low
 
     @patch("chatbot.services.rag_service.get_embeddings")
     def test_im_fine_is_handled_as_greeting_status(self, mock_embed) -> None:

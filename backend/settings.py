@@ -14,14 +14,22 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# In local/dev runs, prefer values from .env over stale shell-exported variables.
+load_dotenv(override=True)
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "30"))
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "documents")
+# Vector size must match the active embedding model output dimension.
+QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "4096"))
 # If the Qdrant collection uses named vectors (e.g. created in Cloud UI), set this to that name.
 QDRANT_VECTOR_NAME = os.getenv("QDRANT_VECTOR_NAME", "").strip() or None
+# Optional safety valve: if true, drop and recreate the collection when vector size mismatches.
+# WARNING: this deletes all vectors in that collection.
+QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH = os.getenv(
+    "QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH", "0"
+).strip().lower() in {"1", "true", "yes", "y", "on"}
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost:8000")
@@ -77,11 +85,11 @@ RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS
 RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
 RAG_LEXICAL_MAX_POINTS = int(os.getenv("RAG_LEXICAL_MAX_POINTS", "1200"))
 # Always merge at least this many top RRF rows into context (deduped by chunk).
-RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "18"))
+RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "8"))
 # Reciprocal rank fusion k (standard ~60). Merges dense + BM25 lists every query.
 RAG_HYBRID_RRF_K = int(os.getenv("RAG_HYBRID_RRF_K", "60"))
-# Min BM25 score for a lexical-only hit to pass the filter (0 = any keyword hit with min overlap).
-RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.0"))
+# Min BM25 score for a lexical-only hit to pass the filter.
+RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.25"))
 # If true, block some queries as "gibberish" BEFORE embeddings/Qdrant (can false-positive real HR questions).
 RAG_ENABLE_GIBBERISH_FILTER = os.getenv("RAG_ENABLE_GIBBERISH_FILTER", "0").strip().lower() in {
     "1",
@@ -99,9 +107,9 @@ RAG_STRICT_NO_HALLUCINATE = os.getenv("RAG_STRICT_NO_HALLUCINATE", "1").strip().
 RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "6"))
 # How many cleaned sentences to join into the main paragraph (can be > selection count).
 RAG_STRICT_ANSWER_BODY_SENTENCES = int(os.getenv("RAG_STRICT_ANSWER_BODY_SENTENCES", "8"))
-RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "4500"))
-RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "16000"))
-RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "6"))
+RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "1800"))
+RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "6000"))
+RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "4"))
 # Drop strict-mode chunks whose context BM25 is below this fraction of the best chunk (0 = off).
 RAG_STRICT_BM25_RELATIVE_FLOOR = float(os.getenv("RAG_STRICT_BM25_RELATIVE_FLOOR", "0.12"))
 # Prefer lines that match query terms (fewer unrelated policy paragraphs in the answer).

@@ -65,6 +65,8 @@ _STOPWORDS = {
     "show",
     "give",
     "provide",
+    "many",
+    "much",
 }
 # Strip only meta / filler words from anchors — do NOT strip handbook vocabulary
 # like policy, employee, work, or company names (those are real topics).
@@ -87,6 +89,44 @@ _GENERIC_QUERY_TERMS = {
     "really",
     "very",
 }
+# Terms that match too many unrelated handbook lines if used alone for strict extraction.
+# Do not add policy nouns that appear in real answers (e.g. "entitled", "leave").
+_WEAK_FOCUS_TERMS = frozenset(
+    {
+        "allowed",
+        "allow",
+        "allows",
+        "use",
+        "using",
+        "used",
+        "personal",
+        "phone",
+        "phones",
+        "cell",
+        "limited",
+        "please",
+        "make",
+        "sure",
+        "however",
+        "also",
+        "same",
+        "other",
+        "any",
+        "some",
+        "such",
+        "salary",
+        "salaries",
+        "people",
+        "efficiency",
+        "efficient",
+        "proportional",
+        "company",
+        "companies",
+        "work",
+        "working",
+        "workplace",
+    }
+)
 _TYPO_CANONICAL_TERMS = {
     # Greeting/conversation
     "how",
@@ -401,7 +441,9 @@ def _hybrid_filter_for_context(
     _ = query  # kept for API symmetry / future query-conditioned filtering
 
     bm25_min = float(getattr(settings, "RAG_LEXICAL_BM25_MIN", 0.0))
-    min_lexical_overlap = 1
+    query_terms = _retrieval_terms(query)
+    # For longer queries, require stronger lexical agreement to reduce noisy chunk admission.
+    min_lexical_overlap = 2 if len(query_terms) >= 8 else 1
 
     sem_scores: List[float] = []
     for r in retrieved:
@@ -520,6 +562,47 @@ def _retrieval_terms(question: str) -> set[str]:
     return out if out else terms
 
 
+def _strong_focus_terms(terms: set[str]) -> set[str]:
+    """
+    Subset of query terms that are specific enough to anchor strict extraction.
+    Weak terms alone match unrelated policy lines (e.g. "allowed", "many").
+    """
+    if not terms:
+        return set()
+    weak = _WEAK_FOCUS_TERMS | _GENERIC_QUERY_TERMS
+    strong = {t for t in terms if t not in weak and len(t) >= 3}
+    if not strong:
+        strong = {t for t in terms if t not in weak and len(t) >= 2}
+    if not strong:
+        strong = set(terms)
+    return strong
+
+
+def _matched_query_terms_in_line(line: str, terms: set[str]) -> set[str]:
+    low = line.lower()
+    out: set[str] = set()
+    for t in terms:
+        if len(t) < 2:
+            continue
+        if re.search(rf"(?<!\w){re.escape(t)}(?!\w)", low, flags=re.IGNORECASE):
+            out.add(t)
+    return out
+
+
+def _line_matches_focus_for_expansion(line: str, terms: set[str], strong_terms: set[str]) -> bool:
+    """True if this line is a safe anchor for query-focused block expansion."""
+    if not terms:
+        return False
+    matched = _matched_query_terms_in_line(line, terms)
+    if not matched:
+        return False
+    if not strong_terms or strong_terms == terms:
+        return True
+    if matched.intersection(strong_terms):
+        return True
+    return len(matched) >= 2
+
+
 def _chunk_reading_key(chunk: Dict[str, Any]) -> tuple[int, int, str]:
     try:
         doc_id = int(chunk.get("doc_id") or 0)
@@ -597,6 +680,7 @@ def _strict_chunk_scores(
     context_chunks: List[Dict[str, Any]],
     *,
     q_terms: set[str],
+    strong_terms: set[str],
     min_overlap: int,
     chunk_order: Dict[str, int],
 ) -> List[tuple[float, int, int, Dict[str, Any]]]:
@@ -613,6 +697,8 @@ def _strict_chunk_scores(
         combined_terms = _tokenize_keywords(text) | _tokenize_keywords(sec)
         overlap = len(q_terms.intersection(combined_terms))
         if overlap < min_overlap:
+            continue
+        if strong_terms and not (strong_terms.intersection(combined_terms)):
             continue
         rows.append((text, sec, c))
 
@@ -673,20 +759,11 @@ def _strict_body_from_chunks_ordered(
     return _filter_to_complete_sentences(joined) or joined
 
 
-def _line_matches_any_query_term(line: str, terms: set[str]) -> bool:
-    low = line.lower()
-    for t in terms:
-        if len(t) < 2:
-            continue
-        if re.search(rf"(?<!\w){re.escape(t)}(?!\w)", low, flags=re.IGNORECASE):
-            return True
-    return False
-
-
 def _strict_body_query_focused(
     chunks: List[Dict[str, Any]],
     *,
     query_terms: set[str],
+    strong_terms: set[str],
     max_chars: int,
     respect_input_order: bool,
 ) -> str:
@@ -695,11 +772,12 @@ def _strict_body_query_focused(
     terms = {t for t in query_terms if len(t) >= 2}
     if not terms:
         return ""
+    strong = strong_terms & terms if strong_terms else _strong_focus_terms(terms)
     parts: List[str] = []
     total = 0
     for c in ordered:
         raw_lines = [ln for ln in str(c.get("text") or "").splitlines() if ln.strip()]
-        block_src = _expand_query_focus_lines(raw_lines, terms)
+        block_src = _expand_query_focus_lines(raw_lines, terms, strong)
         block = _filter_to_complete_sentences(_clean_extractive_sentence(" ".join(block_src)).strip(" -•*"))
         if not block:
             continue
@@ -860,17 +938,23 @@ def _filter_to_complete_sentences(text: str) -> str:
     return " ".join(kept) if kept else t
 
 
-def _expand_query_focus_lines(raw_lines: List[str], terms: set[str]) -> List[str]:
+def _expand_query_focus_lines(
+    raw_lines: List[str],
+    terms: set[str],
+    strong_terms: set[str],
+) -> List[str]:
     """
     When some lines match query terms, include the full contiguous block from the first
     through the last matching line (and non-empty lines in between) so we do not splice
     isolated mid-paragraph lines into half-sentences.
+    Uses anchor-aware matching so weak-only hits (e.g. "allowed" alone) do not expand.
     """
     cleaned = [ln.strip() for ln in raw_lines if ln.strip()]
     cleaned = [ln for ln in cleaned if not line_looks_like_toc_leader(ln)]
     if not cleaned:
         return []
-    match = [_line_matches_any_query_term(ln, terms) for ln in cleaned]
+    strong = strong_terms if strong_terms else _strong_focus_terms(terms)
+    match = [_line_matches_focus_for_expansion(ln, terms, strong) for ln in cleaned]
     if not any(match):
         return cleaned
     first = min(i for i, m in enumerate(match) if m)
@@ -1196,9 +1280,10 @@ def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str
     Deterministic fallback: extract relevant sentences directly from retrieved context.
     Prevents false "I don't know" on policy questions where text is present.
     """
-    q_terms = _tokenize_keywords(question)
+    q_terms = set(_retrieval_terms(question)) or _tokenize_keywords(question)
     if not q_terms:
         return ""
+    strong_terms = _strong_focus_terms(q_terms)
 
     ordered_chunks = _sort_chunks_by_reading_order(list(context_chunks))
     candidates: List[tuple[int, int, int, str]] = []
@@ -1215,9 +1300,13 @@ def _extractive_answer_from_context(question: str, context_chunks: List[Dict[str
                 continue
             if sentence[0].isalpha() and sentence[0].islower():
                 continue
-            overlap = len(q_terms.intersection(_tokenize_keywords(sentence)))
-            if overlap > 0:
-                candidates.append((ck_idx, pos, overlap, sentence))
+            sent_terms = _tokenize_keywords(sentence)
+            overlap = len(q_terms.intersection(sent_terms))
+            if overlap <= 0:
+                continue
+            if strong_terms and not (strong_terms.intersection(sent_terms)) and overlap < 2:
+                continue
+            candidates.append((ck_idx, pos, overlap, sentence))
 
     if not candidates:
         return ""
@@ -1272,8 +1361,12 @@ def _extractive_answer_with_sources_from_context(
     if not q_terms:
         return "", []
 
+    strong_terms = _strong_focus_terms(q_terms)
+
     min_overlap = int(getattr(settings, "RAG_STRICT_MIN_SENTENCE_OVERLAP", 1))
     if len(q_terms) >= 8:
+        min_overlap = max(min_overlap, 2)
+    if len(q_terms) >= 3:
         min_overlap = max(min_overlap, 2)
 
     max_chunks_for_body = int(getattr(settings, "RAG_STRICT_MAX_CHUNKS_FOR_BODY", 12))
@@ -1286,6 +1379,7 @@ def _extractive_answer_with_sources_from_context(
     chunk_scored = _strict_chunk_scores(
         context_chunks,
         q_terms=q_terms,
+        strong_terms=strong_terms,
         min_overlap=min_overlap,
         chunk_order=chunk_order,
     )
@@ -1320,32 +1414,13 @@ def _extractive_answer_with_sources_from_context(
     )
     selected_chunks = [c for _bm25, _ov, c in selected_scored]
 
-    # Source section / page: use Qdrant payload only. If ingestion left them empty,
-    # show Unknown — do not guess from chunk text (that caused "fake" citations vs payload).
-    section: Optional[str] = None
-    page: Optional[int] = None
-    for chunk_meta in selected_chunks:
-        meta_sec = (chunk_meta.get("source_section") or "").strip()
-        meta_page = chunk_meta.get("page_number")
-        ctext = str(chunk_meta.get("text") or "")
-        if section is None and meta_sec and _section_label_plausible_for_chunk(meta_sec, ctext):
-            section = meta_sec
-        if page is None and meta_page is not None:
-            try:
-                page = int(meta_page)
-            except (TypeError, ValueError):
-                pass
-        if section is not None and page is not None:
-            break
-    section_str = section or "Unknown"
-    page_str = str(page) if page is not None else "Unknown"
-
     body_char_cap = int(getattr(settings, "RAG_STRICT_ANSWER_BODY_CHARS", 8000))
     answer_paragraph = ""
     if getattr(settings, "RAG_STRICT_QUERY_FOCUSED_BODY", True):
         answer_paragraph = _strict_body_query_focused(
             selected_chunks,
             query_terms=q_terms,
+            strong_terms=strong_terms,
             max_chars=body_char_cap,
             respect_input_order=True,
         )
@@ -1379,18 +1454,8 @@ def _extractive_answer_with_sources_from_context(
     if not _answer_includes_question_anchors(answer_paragraph, question):
         return "", []
 
-    answer_lines: List[str] = [answer_paragraph, ""]
-    answer_lines.extend(
-        [
-            "Source section",
-            section_str,
-            "",
-            "Page number",
-            page_str,
-        ]
-    )
-
-    return "\n".join(answer_lines).strip(), selected_chunks
+    # Return body only; source/page metadata is appended in the formatter layer.
+    return answer_paragraph.strip(), selected_chunks
 
 
 def _should_use_extractive_fallback(question: str, context_chunks: List[Dict[str, Any]]) -> bool:
@@ -1423,10 +1488,15 @@ def _query_is_covered_by_context(question: str, context_chunks: List[Dict[str, A
 
 def _answer_includes_question_anchors(answer_body: str, question: str) -> bool:
     """True when the draft still reflects at least one substantive term from the question."""
-    terms = _retrieval_terms(question)
+    terms = set(_retrieval_terms(question))
+    if not terms:
+        terms = _tokenize_keywords(question)
     if not terms:
         return True
     low = (answer_body or "").lower()
+    strong = _strong_focus_terms(terms)
+    if strong:
+        return any(t in low for t in strong)
     return any(t in low for t in terms)
 
 

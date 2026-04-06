@@ -20,7 +20,7 @@ class QdrantService:
     and deletion (remove all vectors belonging to a document).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, validate_vector_dimension: bool = True) -> None:
         q_timeout = float(getattr(settings, "QDRANT_TIMEOUT_SEC", 30.0))
         self.client = QdrantClient(
             url=settings.QDRANT_URL,
@@ -28,10 +28,12 @@ class QdrantService:
             timeout=q_timeout,
         )
         self.collection_name = getattr(settings, "QDRANT_COLLECTION_NAME", "documents")
-        self.vector_size = getattr(settings, "QDRANT_VECTOR_SIZE", 1536)
+        self.vector_size = getattr(settings, "QDRANT_VECTOR_SIZE", 4096)
+        self._validate_vector_dimension = bool(validate_vector_dimension)
         # Named-vector collections (common when created in Qdrant Cloud UI) require
         # vector={"name": [...]} on upsert and `using=name` on query.
-        self._vector_using: str | None = None
+        explicit = getattr(settings, "QDRANT_VECTOR_NAME", None)
+        self._vector_using: str | None = (str(explicit).strip() if explicit else "") or None
         self._ensure_collection()
         self._vector_using = self._resolve_vector_using()
 
@@ -73,6 +75,35 @@ class QdrantService:
             return None
         return None
 
+    def _read_existing_vector_size(self) -> Optional[int]:
+        """
+        Read the effective vector dimension from an existing collection.
+        Supports both unnamed and named-vector configs.
+        """
+        if not self.client.collection_exists(self.collection_name):
+            return None
+        try:
+            info = self.client.get_collection(self.collection_name)
+            params = getattr(getattr(info, "config", None), "params", None)
+            vectors = getattr(params, "vectors", None) if params is not None else None
+            if isinstance(vectors, VectorParams):
+                size = getattr(vectors, "size", None)
+                return int(size) if size is not None else None
+            if isinstance(vectors, dict):
+                # Prefer configured vector name if provided.
+                if self._vector_using and self._vector_using in vectors:
+                    vp = vectors[self._vector_using]
+                    size = getattr(vp, "size", None)
+                    return int(size) if size is not None else None
+                # Otherwise use first available vector config.
+                if vectors:
+                    first = next(iter(vectors.values()))
+                    size = getattr(first, "size", None)
+                    return int(size) if size is not None else None
+            return None
+        except Exception:
+            return None
+
     def _wrap_vector(self, embedding: list) -> list | dict:
         if self._vector_using:
             return {self._vector_using: embedding}
@@ -84,6 +115,29 @@ class QdrantService:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
             )
+        else:
+            existing_dim = self._read_existing_vector_size()
+            if (
+                self._validate_vector_dimension
+                and existing_dim is not None
+                and int(existing_dim) != int(self.vector_size)
+            ):
+                auto_recreate = bool(
+                    getattr(settings, "QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH", False)
+                )
+                if auto_recreate:
+                    self.client.delete_collection(collection_name=self.collection_name)
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
+                    )
+                else:
+                    raise RuntimeError(
+                        "Qdrant vector dimension mismatch for collection "
+                        f"'{self.collection_name}': existing={existing_dim}, configured={self.vector_size}. "
+                        "Use a new QDRANT_COLLECTION_NAME, recreate the collection, or set "
+                        "QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH=1 (destructive)."
+                    )
 
         # Ensure there is an index on the payload field `doc_id` for efficient filtered deletes.
         # Safe to call if it already exists.

@@ -175,7 +175,7 @@ def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
 
     _sm = getattr(settings, "OPENROUTER_SUMMARY_MODEL", None)
     model = (str(_sm).strip() if _sm else "") or getattr(
-        settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"
+        settings, "OPENROUTER_CHAT_MODEL", "arcee-ai/trinity-large-preview:free"
     )
     max_out = int(getattr(settings, "OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS", 384))
     client = _openrouter_client()
@@ -190,16 +190,18 @@ def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You shorten handbook assistant replies for a chat UI.\n"
-                        "Target roughly 25–40% fewer words than the draft when possible, without losing "
-                        "any policy facts, numbers, dates, thresholds, steps, or exceptions.\n"
-                        "Merge redundant sentences; drop filler and repetition. Do not add information.\n"
-                        "Every sentence must be grammatically complete: do not start or end with a "
-                        "mid-sentence fragment (no orphaned clauses).\n"
-                        "Use plain text; optional ## headings for major sections when the draft has clear topics.\n"
-                        "No * or **. Numbered points are fine when they aid scanning.\n"
-                        "Output only the shortened answer — no preamble, title, or 'Sources:' section."
-                    ),
+                        "You are a policy-summary editor for an employee handbook chatbot.\n"
+                        "Rewrite the draft into a shorter employee-facing answer while preserving policy meaning exactly.\n"
+                        "Target about 25-40% fewer words when possible.\n"
+                        "Do not remove or alter any policy-critical detail: eligibility, scope, required approvals, "
+                        "required documents, timelines/deadlines, amounts/percentages, limits/caps, conditions, "
+                        "exceptions, and role/location-specific rules.\n"
+                        "Do not add new facts, assumptions, interpretations, or legal advice.\n"
+                        "Merge repetition and remove filler, but keep actionable steps in the original order when the draft is procedural.\n"
+                        "If the draft contains uncertainty or conditional wording (e.g., may, must, only if, unless), preserve it.\n"
+                        "Every sentence must be grammatically complete and standalone; no fragments.\n"
+                        "Output only the shortened answer body. Do not include preamble, title, or Sources section."
+                    )
                 },
                 {
                     "role": "user",

@@ -230,6 +230,20 @@ def upload_document(request):
         doc.status = "error"
         doc.error_message = str(e)
         doc.save(update_fields=["status", "error_message"])
+        msg = str(e)
+        # Surface vector-size issues as a user-actionable 400 instead of an opaque traceback.
+        if "vector dimension mismatch" in msg.lower() or "vector dimension error" in msg.lower():
+            return Response(
+                {
+                    "error": msg,
+                    "hint": (
+                        "Embedding dimension and Qdrant collection size must match. "
+                        "Set QDRANT_VECTOR_SIZE to your model dimension and use a fresh "
+                        "QDRANT_COLLECTION_NAME (or recreate the collection)."
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         raise
 
     return Response(
@@ -252,8 +266,19 @@ def delete_document(request, doc_id):
     if not doc:
         return Response({"error": "Document not found"}, status=404)
 
-    qdrant = QdrantService()
-    qdrant.delete_by_doc_id(doc_id)
+    try:
+        # Deletion by payload filter does not depend on vector dimension.
+        # Allow cleanup even if collection/model dimensions changed over time.
+        qdrant = QdrantService(validate_vector_dimension=False)
+        qdrant.delete_by_doc_id(doc_id)
+    except Exception as e:
+        return Response(
+            {
+                "error": "Failed to delete vectors from Qdrant.",
+                "details": str(e),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     doc.delete()
 
