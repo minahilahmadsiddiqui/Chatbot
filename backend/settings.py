@@ -112,8 +112,8 @@ RAG_STRICT_QUERY_FOCUSED_BODY = os.getenv("RAG_STRICT_QUERY_FOCUSED_BODY", "1").
     "y",
     "on",
 }
-# If strict verbatim assembly returns nothing, call the LLM with a recall-oriented prompt.
-RAG_STRICT_FALLBACK_TO_LLM = os.getenv("RAG_STRICT_FALLBACK_TO_LLM", "1").strip().lower() in {
+# If strict verbatim assembly returns nothing, call the LLM (can invent; default off).
+RAG_STRICT_FALLBACK_TO_LLM = os.getenv("RAG_STRICT_FALLBACK_TO_LLM", "0").strip().lower() in {
     "1",
     "true",
     "yes",

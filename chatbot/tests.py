@@ -6,7 +6,6 @@ import tiktoken
 from django.test import SimpleTestCase, override_settings
 
 from chatbot.services.rag_service import (
-    FALLBACK_PHRASE,
     UNKNOWN_POLICY_PHRASE,
     run_rag_query,
     _sanitize_query,
@@ -238,7 +237,7 @@ class RagServiceTests(SimpleTestCase):
         with patch("chatbot.services.rag_service.QdrantService", return_value=DummyQdrant()):
             result = run_rag_query(query="What is HR policy?", top_k=3, threshold=0.9, max_context_tokens=200)
 
-        assert result["answer"] == FALLBACK_PHRASE
+        assert result["answer"] == UNKNOWN_POLICY_PHRASE
         assert result["fallback_used"] is True
         assert result["top_k"] == 3
         assert result["threshold"] == 0.9

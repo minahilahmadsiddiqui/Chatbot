@@ -13,7 +13,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # Keep in sync with chatbot.services.gemini_service.UNKNOWN_POLICY_PHRASE
-UNKNOWN_POLICY_PHRASE = "The document doesn't mention it, contact the HR department."
+UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
 
 # Appended after source/page metadata on successful answers (plain + HTML).
 CLOSING_LINE = "If you have any further questions, do let me know."
@@ -265,7 +265,7 @@ def is_fallback_answer(t: str) -> bool:
     if s == UNKNOWN_POLICY_PHRASE:
         return True
     low = s.lower().rstrip(".")
-    return low == "contact the hr department"
+    return low in {"contact the hr", "contact the hr department"}
 
 
 # Backwards compatibility for internal checks

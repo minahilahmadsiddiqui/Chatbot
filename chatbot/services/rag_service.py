@@ -464,7 +464,8 @@ def _hybrid_filter_for_context(
         merged.append(r)
 
     if not merged:
-        return list(retrieved[: max(top_k * 4, 24)])
+        # Do not widen to weak semantic hits — that pulls in unrelated handbook text.
+        return []
 
     return merged
 
@@ -1310,12 +1311,6 @@ def _extractive_answer_with_sources_from_context(
     if not selected_scored and before_bm_trim:
         selected_scored = before_bm_trim[:1]
 
-    # Semantic retrieval already ranked these chunks; if keyword overlap fails
-    # (synonyms, phrasing), still answer from the retrieved context verbatim.
-    if not selected_scored and context_chunks:
-        fb = _sort_chunks_by_reading_order(list(context_chunks))[:max_chunks_for_body]
-        selected_scored = [(0.0, 0, c) for c in fb]
-
     if not selected_scored:
         return "", []
 
@@ -1381,6 +1376,9 @@ def _extractive_answer_with_sources_from_context(
     if answer_paragraph and not answer_paragraph.endswith("."):
         answer_paragraph += "."
 
+    if not _answer_includes_question_anchors(answer_paragraph, question):
+        return "", []
+
     answer_lines: List[str] = [answer_paragraph, ""]
     answer_lines.extend(
         [
@@ -1421,6 +1419,35 @@ def _query_is_covered_by_context(question: str, context_chunks: List[Dict[str, A
         context_terms |= _tokenize_keywords(str(c.get("text") or ""))
     overlap = len(rterms.intersection(context_terms))
     return overlap >= 1
+
+
+def _answer_includes_question_anchors(answer_body: str, question: str) -> bool:
+    """True when the draft still reflects at least one substantive term from the question."""
+    terms = _retrieval_terms(question)
+    if not terms:
+        return True
+    low = (answer_body or "").lower()
+    return any(t in low for t in terms)
+
+
+def _llm_draft_grounded_in_context(draft: str, context_chunks: List[Dict[str, Any]]) -> bool:
+    """
+    Cheap lexical check: most content words in the model reply should appear in retrieved text.
+    Reduces hallucinations when RAG_STRICT_FALLBACK_TO_LLM is enabled.
+    """
+    d = (draft or "").strip()
+    if not d or d == UNKNOWN_POLICY_PHRASE:
+        return True
+    ctx = "\n".join(str(c.get("text") or "") for c in context_chunks).lower()
+    d_body = re.sub(r"(?is)\n\s*sources:.*", "", d).strip()
+    terms = [t for t in _tokenize_keywords(d_body) if len(t) >= 3]
+    if not terms:
+        terms = list(_tokenize_keywords(d_body))
+    if not terms:
+        return False
+    hits = sum(1 for t in terms if t in ctx)
+    need = 3 if len(terms) >= 5 else max(1, min(len(terms), 2))
+    return hits >= need
 
 
 def _prefer_extractive_for_question(question: str) -> bool:
@@ -1476,7 +1503,7 @@ def _manual_pipeline(
         if not context_chunks:
             latency_ms = int((time.time() - t0) * 1000)
             return {
-                "answer": FALLBACK_PHRASE,
+                "answer": UNKNOWN_POLICY_PHRASE,
                 "fallback_used": True,
                 "retrieved": [
                     {
@@ -1518,6 +1545,9 @@ def _manual_pipeline(
                     prefer_answer_from_context=True,
                 )
                 if not answer.strip() or answer.strip() == UNKNOWN_POLICY_PHRASE:
+                    answer = UNKNOWN_POLICY_PHRASE
+                    context_chunks = []
+                elif not _llm_draft_grounded_in_context(answer, context_chunks):
                     answer = UNKNOWN_POLICY_PHRASE
                     context_chunks = []
             elif not extracted_answer:
@@ -1715,6 +1745,12 @@ def run_rag_query(
                         "fallback_used": True,
                         "context_chunks": [],
                     }
+                if not _llm_draft_grounded_in_context(answer, context_chunks):
+                    return {
+                        "answer": UNKNOWN_POLICY_PHRASE,
+                        "fallback_used": True,
+                        "context_chunks": [],
+                    }
                 return {
                     "answer": answer,
                     "fallback_used": False,
@@ -1758,7 +1794,7 @@ def run_rag_query(
         }
 
     def fallback_node(state: RagState) -> RagState:
-        return {"answer": FALLBACK_PHRASE, "fallback_used": True, "context_chunks": []}
+        return {"answer": UNKNOWN_POLICY_PHRASE, "fallback_used": True, "context_chunks": []}
 
     def route_fn(state: RagState) -> str:
         return "fallback" if state.get("fallback_used") else "answer"

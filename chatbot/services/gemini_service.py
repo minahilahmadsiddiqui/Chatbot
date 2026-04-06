@@ -10,7 +10,7 @@ from openai import OpenAI
 
 from chatbot.services.response_beautify_service import beautify_llm_response
 
-UNKNOWN_POLICY_PHRASE = "The document doesn't mention it, contact the HR department."
+UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
 
 _raw_llm_log_lock = threading.Lock()
 
@@ -100,7 +100,7 @@ _OPENROUTER_PROMPT_STUB = (
     "# OpenRouter prompt log — exact system + user for the main CHAT completion append below.\n"
     "# With RAG_STRICT_NO_HALLUCINATE (default), answers usually come from extractive retrieval only;\n"
     "# generate_answer is not called, so this file stays as this notice until an LLM path runs\n"
-    "# (e.g. empty extractive + RAG_STRICT_FALLBACK_TO_LLM, or strict mode off).\n\n"
+    "# (e.g. empty extractive + RAG_STRICT_FALLBACK_TO_LLM=1, or strict mode off).\n\n"
 )
 _OPENROUTER_RAW_STUB = (
     "# OpenRouter raw assistant replies (before summarize + beautify in gemini_service) append below.\n"
