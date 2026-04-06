@@ -1,12 +1,150 @@
 from __future__ import annotations
 
 import re
-from typing import List, Dict, Any
+import threading
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 from django.conf import settings
 from openai import OpenAI
 
+from chatbot.services.response_beautify_service import beautify_llm_response
+
 UNKNOWN_POLICY_PHRASE = "The document doesn't mention it, contact the HR department."
+
+_raw_llm_log_lock = threading.Lock()
+
+
+def _openrouter_raw_log_file_path() -> Optional[Path]:
+    """
+    Log file for OpenRouter chat completion text only (exact API message.content),
+    before strip, summarize, or beautify_llm_response.
+    Override: settings.OPENROUTER_RAW_LOG_PATH (full path to file).
+    """
+    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
+        return None
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    configured = getattr(settings, "OPENROUTER_RAW_LOG_PATH", None)
+    if configured:
+        return Path(configured)
+    return Path(base_dir) / "logs" / "openrouter_raw.log"
+
+
+def _openrouter_prompt_log_file_path() -> Optional[Path]:
+    """
+    Log file: exact system + user messages for the *initial* main chat completion only.
+    Override: settings.OPENROUTER_PROMPT_LOG_PATH.
+    """
+    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
+        return None
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    configured = getattr(settings, "OPENROUTER_PROMPT_LOG_PATH", None)
+    if configured:
+        return Path(configured)
+    return Path(base_dir) / "logs" / "openrouter_prompt.log"
+
+
+def _append_openrouter_initial_prompt(*, model: str, system_prompt: str, user_prompt: str) -> None:
+    """Append one record: model id + system + user content as sent to OpenRouter (initial call only)."""
+    path = _openrouter_prompt_log_file_path()
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = (
+        f"model={model}\n"
+        "----- system -----\n"
+        f"{system_prompt}\n"
+        "----- user -----\n"
+        f"{user_prompt}\n"
+        "----- end request -----\n\n"
+    )
+    with _raw_llm_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(record)
+
+
+def _append_openrouter_raw_response(text: str) -> None:
+    """Append exact OpenRouter assistant text; no strip (only ensures trailing newline in file)."""
+    path = _openrouter_raw_log_file_path()
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _raw_llm_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+
+
+def _raw_answer_log_file_path() -> Optional[Path]:
+    """
+    Path to the raw answer log file (no console).
+    settings.LLM_RAW_LOG_PATH overrides; default BASE_DIR/logs/answer_raw_before_ui.log
+    """
+    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
+        return None
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    configured = getattr(settings, "LLM_RAW_LOG_PATH", None)
+    if configured:
+        return Path(configured)
+    return Path(base_dir) / "logs" / "answer_raw_before_ui.log"
+
+
+_OPENROUTER_PROMPT_STUB = (
+    "# OpenRouter prompt log — exact system + user for the main CHAT completion append below.\n"
+    "# With RAG_STRICT_NO_HALLUCINATE (default), answers usually come from extractive retrieval only;\n"
+    "# generate_answer is not called, so this file stays as this notice until an LLM path runs\n"
+    "# (e.g. empty extractive + RAG_STRICT_FALLBACK_TO_LLM, or strict mode off).\n\n"
+)
+_OPENROUTER_RAW_STUB = (
+    "# OpenRouter raw assistant replies (before summarize + beautify in gemini_service) append below.\n"
+    "# Same as openrouter_prompt.log: no chat call → no entries here.\n\n"
+)
+
+
+def ensure_raw_answer_log_dir() -> None:
+    """
+    Create log dirs; seed openrouter_*.log with a header if missing (extractive-only runs never
+    call generate_answer, so those files would not exist otherwise).
+    """
+    for getter in (_openrouter_prompt_log_file_path, _openrouter_raw_log_file_path, _raw_answer_log_file_path):
+        path = getter()
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+    pp = _openrouter_prompt_log_file_path()
+    rp = _openrouter_raw_log_file_path()
+    if pp is None and rp is None:
+        return
+    with _raw_llm_log_lock:
+        if pp is not None and not pp.exists():
+            pp.write_text(_OPENROUTER_PROMPT_STUB, encoding="utf-8")
+        if rp is not None and not rp.exists():
+            rp.write_text(_OPENROUTER_RAW_STUB, encoding="utf-8")
+
+
+def append_raw_answer_before_ui_processing(text: str) -> None:
+    """
+    Append extractive RAG answer text (no OpenRouter call) for audit.
+    OpenRouter chat output is logged separately to openrouter_raw.log inside generate_answer.
+    """
+    path = _raw_answer_log_file_path()
+    if path is None:
+        return
+    raw = (text or "").strip()
+    if not raw:
+        return
+    ensure_raw_answer_log_dir()
+    with _raw_llm_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(raw)
+            if not raw.endswith("\n"):
+                f.write("\n")
 
 
 def _openrouter_client() -> OpenAI:
@@ -17,49 +155,6 @@ def _openrouter_client() -> OpenAI:
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
     return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
-
-
-def _beautify_answer(text: str) -> str:
-    """
-    Normalize model output into readable markdown-style sections and bullets.
-    Keeps content unchanged as much as possible while fixing jumbled formatting.
-    """
-    t = (text or "").strip()
-    if not t:
-        return t
-    if t == UNKNOWN_POLICY_PHRASE:
-        return t
-
-    # Force plain-text output (no markdown symbols) and clear line-by-line points.
-    t = t.replace("**", "")
-    t = t.replace("*", "")
-
-    # Break inline list markers into separate lines.
-    t = re.sub(r"([^\n])\s+(\d+[\.\)])\s+", r"\1\n\2 ", t)
-    t = re.sub(r"([^\n])\s+-\s+", r"\1\n- ", t)
-
-    # Normalize common bullet markers to numbered points.
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    out: List[str] = []
-    num = 1
-    for ln in lines:
-        # Keep section-like labels ending with ':'
-        if ln.endswith(":"):
-            out.append(ln)
-            out.append("")
-            num = 1
-            continue
-
-        # Remove existing leading markers.
-        ln = re.sub(r"^(?:-|\d+[\.\)])\s*", "", ln).strip()
-        if not ln:
-            continue
-
-        out.append(f"{num}. {ln}")
-        out.append("")  # one blank line after each point
-        num += 1
-
-    return "\n".join(out).strip()
 
 
 def _strip_trailing_sources_block(text: str) -> str:
@@ -101,7 +196,8 @@ def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
                         "Merge redundant sentences; drop filler and repetition. Do not add information.\n"
                         "Every sentence must be grammatically complete: do not start or end with a "
                         "mid-sentence fragment (no orphaned clauses).\n"
-                        "Use plain text only (no * or **). Numbered points are fine when they aid scanning.\n"
+                        "Use plain text; optional ## headings for major sections when the draft has clear topics.\n"
+                        "No * or **. Numbered points are fine when they aid scanning.\n"
                         "Output only the shortened answer — no preamble, title, or 'Sources:' section."
                     ),
                 },
@@ -138,6 +234,7 @@ def generate_answer(
     for compatibility with callers and should not normally be returned
     when context is present.
     """
+    ensure_raw_answer_log_dir()
     client = _openrouter_client()
 
     # Keep the prompt tight and explicit; prefer grounded answers over fallback
@@ -200,6 +297,7 @@ def generate_answer(
         "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
         "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
     }
+    _append_openrouter_initial_prompt(model=model, system_prompt=system_prompt, user_prompt=prompt)
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -210,7 +308,9 @@ def generate_answer(
         max_tokens=max_output_tokens,
         extra_headers=extra_headers,
     )
-    content = (response.choices[0].message.content or "").strip()
+    first_msg = response.choices[0].message.content
+    raw_pieces: List[str] = [first_msg if first_msg is not None else ""]
+    content = (first_msg or "").strip()
     finish_reason = getattr(response.choices[0], "finish_reason", None)
 
     # Continuation rounds multiply latency; keep low (raise max_output_tokens instead).
@@ -231,7 +331,9 @@ def generate_answer(
             max_tokens=max_output_tokens,
             extra_headers=extra_headers,
         )
-        continuation = (follow_up.choices[0].message.content or "").strip()
+        cont_msg = follow_up.choices[0].message.content
+        raw_pieces.append(cont_msg if cont_msg is not None else "")
+        continuation = (cont_msg or "").strip()
         if not continuation:
             break
         content = f"{content}\n{continuation}".strip()
@@ -240,19 +342,21 @@ def generate_answer(
 
     if not content:
         return UNKNOWN_POLICY_PHRASE
-    out = _beautify_answer(content)
-    if out.strip() == UNKNOWN_POLICY_PHRASE:
-        return out
+    # Exact OpenRouter assistant text (joined), before strip/summarize/beautify in this function.
+    openrouter_raw = "\n".join(raw_pieces)
+    if openrouter_raw.strip():
+        _append_openrouter_raw_response(openrouter_raw)
     if getattr(settings, "RAG_LLM_POST_SUMMARY", True):
         min_chars = int(getattr(settings, "RAG_SUMMARIZE_MIN_INPUT_CHARS", 200))
-        if len(out) >= min_chars:
-            body = _strip_trailing_sources_block(out)
+        if len(content) >= min_chars:
+            body = _strip_trailing_sources_block(content)
             if len(body.strip()) < 20:
-                body = out
+                body = content
             summarized = summarize_llm_answer_for_display(question=question, draft_body=body)
             if summarized.strip():
-                out = summarized.strip()
-    return out
+                content = summarized.strip()
+    out = beautify_llm_response(content)
+    return out if out.strip() else content
 
 
 # Backwards-compatible alias for existing imports.

@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Raw LLM output log (append-only; may contain sensitive policy text)
+logs/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import re
 import math
@@ -9,9 +10,15 @@ from typing import Any, Dict, List, Optional, TypedDict
 from django.conf import settings
 
 from chatbot.services.embeddings_service import get_embeddings
-from chatbot.services.gemini_service import UNKNOWN_POLICY_PHRASE, generate_answer
+from chatbot.services.gemini_service import (
+    UNKNOWN_POLICY_PHRASE,
+    append_raw_answer_before_ui_processing,
+    generate_answer,
+)
 from chatbot.services.qdrant_service import QdrantService
 from chatbot.services.text_splitter import count_tokens, line_looks_like_toc_leader, truncate_text_to_token_budget
+
+logger = logging.getLogger(__name__)
 
 FALLBACK_PHRASE = "Contact the HR department"
 _HANDBOOK_ASSISTANT_GREETING = (
@@ -1518,6 +1525,7 @@ def _manual_pipeline(
                 context_chunks = []
             else:
                 answer = extracted_answer
+                append_raw_answer_before_ui_processing(extracted_answer)
                 context_chunks = used_chunks
         else:
             answer = generate_answer(
@@ -1538,11 +1546,9 @@ def _manual_pipeline(
                 extracted = _extractive_answer_from_context(sanitized, context_chunks)
                 if extracted:
                     answer = extracted
+                    append_raw_answer_before_ui_processing(extracted)
     except Exception:
-        # TEMP: log the real error so we can debug why RAG fell back.
-        import traceback
-
-        traceback.print_exc()
+        logger.exception("RAG manual pipeline failed")
         latency_ms = int((time.time() - t0) * 1000)
         return {
             "answer": FALLBACK_PHRASE,
@@ -1720,6 +1726,7 @@ def run_rag_query(
                     "fallback_used": True,
                     "context_chunks": [],
                 }
+            append_raw_answer_before_ui_processing(extracted_answer)
             return {
                 "answer": extracted_answer,
                 "fallback_used": False,
@@ -1744,6 +1751,7 @@ def run_rag_query(
             extracted = _extractive_answer_from_context(question, context_chunks)
             if extracted:
                 answer = extracted
+                append_raw_answer_before_ui_processing(extracted)
         return {
             "answer": answer,
             "fallback_used": answer.strip() in {FALLBACK_PHRASE, UNKNOWN_POLICY_PHRASE},

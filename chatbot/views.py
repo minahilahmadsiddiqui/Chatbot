@@ -10,12 +10,16 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.views.decorators.csrf import csrf_exempt
-from django.http import StreamingHttpResponse
-
 
 from chatbot.models import ChatMessage, Document
 from chatbot.services.embeddings_service import get_embeddings
 from chatbot.services.qdrant_service import QdrantService
+from chatbot.services.response_beautify_service import (
+    build_chat_answer_html,
+    clean_answer_body_only,
+    format_plain_answer_with_metadata,
+)
+from chatbot.services.gemini_service import ensure_raw_answer_log_dir
 from chatbot.services.rag_service import FALLBACK_PHRASE, run_rag_query
 from chatbot.services.text_splitter import (
     handbook_has_auto_structure,
@@ -309,6 +313,7 @@ def chat_query(request):
     except Exception:
         return Response({"error": "Invalid 'top_k' or 'threshold' types."}, status=status.HTTP_400_BAD_REQUEST)
 
+    ensure_raw_answer_log_dir()
     t0 = time.time()
     result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f)
     latency_ms = int((time.time() - t0) * 1000)
@@ -324,19 +329,29 @@ def chat_query(request):
         elif chunk_index is not None:
             retrieved_chunk_ids.append(str(chunk_index))
 
+    ans_raw = result.get("answer") or FALLBACK_PHRASE
+    ans_body = clean_answer_body_only(ans_raw, citations)
+    append_meta = result.get("pipeline") != "greeting_short_circuit"
+    ans = format_plain_answer_with_metadata(
+        ans_body, citations, append_source_metadata=append_meta
+    )
+
     ChatMessage.objects.create(
         session_id=str(session_id),
         query=str(query),
         retrieved_chunk_ids=retrieved_chunk_ids,
         model_used=str(getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")),
-        response_text=result.get("answer") or FALLBACK_PHRASE,
+        response_text=ans,
         latency_ms=latency_ms,
         fallback_used=bool(result.get("fallback_used")),
     )
 
     return Response(
         {
-            "answer": result.get("answer") or FALLBACK_PHRASE,
+            "answer": ans,
+            "answer_html": build_chat_answer_html(
+                answer=ans_body, citations=citations, append_source_metadata=append_meta
+            ),
             "fallback_used": bool(result.get("fallback_used")),
             "retrieved": retrieved,
             "citations": citations,
@@ -369,10 +384,21 @@ def chat_query_stream(request):
     except Exception:
         return Response({"error": "Invalid 'top_k' or 'threshold' types."}, status=status.HTTP_400_BAD_REQUEST)
 
+    ensure_raw_answer_log_dir()
     result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f)
     citations = result.get("citations") or []
     top_k_used = result.get("top_k")
     threshold_used = result.get("threshold")
+
+    answer_raw = result.get("answer") or FALLBACK_PHRASE
+    answer_body = clean_answer_body_only(answer_raw, citations)
+    append_meta = result.get("pipeline") != "greeting_short_circuit"
+    answer = format_plain_answer_with_metadata(
+        answer_body, citations, append_source_metadata=append_meta
+    )
+    answer_html = build_chat_answer_html(
+        answer=answer_body, citations=citations, append_source_metadata=append_meta
+    )
 
     # Persist audit row (kept non-blocking for the client; still synchronous server-side).
     retrieved_chunk_ids: List[str] = []
@@ -388,23 +414,20 @@ def chat_query_stream(request):
         query=str(query),
         retrieved_chunk_ids=retrieved_chunk_ids,
         model_used=str(getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")),
-        response_text=result.get("answer") or FALLBACK_PHRASE,
+        response_text=answer,
         latency_ms=int(result.get("latency_ms") or 0),
         fallback_used=bool(result.get("fallback_used")),
     )
-
-    answer = result.get("answer") or FALLBACK_PHRASE
 
     def event_stream():
         # Minimal SSE envelope; frontend can render as it arrives.
         yield "event: start\ndata: {}\n\n"
         # JSON-encode to preserve newlines/spacing reliably in SSE clients.
         yield f"event: answer\ndata: {json.dumps(answer)}\n\n"
+        yield f"event: answer_html\ndata: {json.dumps(answer_html)}\n\n"
         yield f"event: citations\ndata: {json.dumps(citations)}\n\n"
         yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used, 'rag_retrieval_ran': result.get('rag_retrieval_ran'), 'pipeline': result.get('pipeline')})}\n\n"
 
-   # return StreamingHttpResponse(event_stream(), content_type="text/event-stream")
-   
     response = StreamingHttpResponse(
         event_stream(),
         content_type="text/event-stream",

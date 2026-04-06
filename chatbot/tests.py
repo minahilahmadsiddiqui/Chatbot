@@ -393,3 +393,81 @@ class RagServiceTests(SimpleTestCase):
         assert result["answer"].strip().lower() != "hi"
         assert not result["answer"].startswith("Hello! I can help you find information in the employee handbook")
         mock_embed.assert_called_once()
+
+
+class ResponseBeautifyHtmlTests(SimpleTestCase):
+    def test_format_plain_metadata_uses_colon_labels_and_unknown_without_citations(self) -> None:
+        from chatbot.services.response_beautify_service import CLOSING_LINE, format_plain_answer_with_metadata
+
+        out = format_plain_answer_with_metadata("I am doing well, thank you.", [])
+        assert "Source: Unknown" in out
+        assert "Page number: Unknown" in out
+        assert CLOSING_LINE in out
+
+    def test_greeting_style_skips_metadata_when_disabled(self) -> None:
+        from chatbot.services.response_beautify_service import CLOSING_LINE, build_chat_answer_html, format_plain_answer_with_metadata
+
+        plain = format_plain_answer_with_metadata(
+            "I am doing well, thank you. How can I help you?", [], append_source_metadata=False
+        )
+        assert plain == "I am doing well, thank you. How can I help you?"
+        assert "Source" not in plain
+        assert CLOSING_LINE not in plain
+
+        html_out = build_chat_answer_html(answer="Hello.", citations=[], append_source_metadata=False)
+        assert "chat-source-meta" not in html_out
+        assert "Source:" not in html_out
+        assert CLOSING_LINE not in html_out
+
+    def test_strip_handbook_page_chapter_noise(self) -> None:
+        from chatbot.services.response_beautify_service import strip_handbook_layout_artifacts
+
+        raw = (
+            "This policy applies. 22 | P age 7 CHAPTER 2: RECRUITMENT AND INDUCTION POLICY "
+            "The company reimburses fees."
+        )
+        out = strip_handbook_layout_artifacts(raw)
+        assert "P age" not in out
+        assert "CHAPTER 2" not in out
+        assert "RECRUITMENT AND INDUCTION" not in out
+        assert "The company reimburses fees" in out
+
+        eq = "Intro === Page 44 === rest of sentence."
+        assert "Page 44" not in strip_handbook_layout_artifacts(eq)
+        assert "rest of sentence" in strip_handbook_layout_artifacts(eq)
+
+    def test_strip_ampersand_section_headings(self) -> None:
+        from chatbot.services.response_beautify_service import strip_handbook_layout_artifacts
+
+        raw = "Proof submitted. & Reimbursement Process • Each receipt must be valid."
+        out = strip_handbook_layout_artifacts(raw)
+        assert "& Reimbursement" not in out
+        assert "Each receipt" in out
+        assert "costs & Benefits" in strip_handbook_layout_artifacts(
+            "Employees enjoy costs & Benefits for all staff."
+        )
+
+    def test_strip_trailing_source_page_footer(self) -> None:
+        from chatbot.services.response_beautify_service import strip_trailing_source_page_footer
+
+        raw = (
+            "This policy will be reviewed quarterly. "
+            "Source section 14.20 Continuous Page number 48"
+        )
+        out = strip_trailing_source_page_footer(raw)
+        assert "Page number" not in out
+        assert "Source section" not in out
+        assert "reviewed quarterly" in out
+
+    def test_build_chat_answer_html_structure(self) -> None:
+        from chatbot.services.response_beautify_service import build_chat_answer_html
+
+        ans = "First paragraph.\n\n• Point one\n• Point two"
+        cites = [{"source_section": "14.20 Continuous", "page": 48}]
+        html_out = build_chat_answer_html(answer=ans, citations=cites)
+        assert '<div class="chat-answer">' in html_out
+        assert "<strong>Source:</strong>" in html_out
+        assert "14.20 Continuous" in html_out
+        assert "<strong>Page number:</strong>" in html_out
+        assert "48" in html_out
+        assert "<ul>" in html_out and "<li>" in html_out
