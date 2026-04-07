@@ -166,6 +166,16 @@ def _strip_trailing_sources_block(text: str) -> str:
     return t
 
 
+def _strip_inline_chunk_tags(text: str) -> str:
+    """
+    Remove inline grounding tags like [Chunk 2] from model output before UI display.
+    """
+    t = text or ""
+    t = re.sub(r"\s*\[Chunk\s+\d+\]\s*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip()
+
+
 def _kw(text: str) -> set[str]:
     toks = {t.lower() for t in re.findall(r"[a-zA-Z0-9]+", text or "")}
     stop = {
@@ -345,10 +355,10 @@ def generate_answer(
         "3) Do NOT use markdown symbols such as * or **.\n"
         "4) Do not include unrelated policies or sections — only what answers the question.\n"
         "5) Every point must be full, grammatically complete sentences — no mid-sentence fragments.\n"
-        "6) Every numbered point MUST end with an evidence tag using the exact chunk number, e.g. [Chunk 2].\n"
-        "7) Use only chunk numbers that appear in Context. Do not invent chunk IDs.\n"
-        "8) If a point cannot be grounded in a chunk, do not include that point.\n"
-        "9) Output only the answer body. Do not add a Sources section.\n"
+        "6) Ground every point strictly in the provided context, but DO NOT print any chunk tags such as [Chunk N].\n"
+        "7) Do not print internal evidence markers, citations, or references in the final answer text.\n"
+        "8) If a point cannot be grounded in context, do not include that point.\n"
+        "9) Output only the answer body in clean user-facing language. Do not add a Sources section.\n"
     )
 
     extra_headers = {
@@ -404,6 +414,7 @@ def generate_answer(
     openrouter_raw = "\n".join(raw_pieces)
     if openrouter_raw.strip():
         _append_openrouter_raw_response(openrouter_raw)
+    content = _strip_inline_chunk_tags(content)
     if getattr(settings, "RAG_LLM_POST_SUMMARY", True):
         min_chars = int(getattr(settings, "RAG_SUMMARIZE_MIN_INPUT_CHARS", 200))
         if len(content) >= min_chars:
@@ -413,6 +424,7 @@ def generate_answer(
             summarized = summarize_llm_answer_for_display(question=question, draft_body=body)
             if summarized.strip():
                 content = summarized.strip()
+    content = _strip_inline_chunk_tags(content)
     out = beautify_llm_response(content)
     return out if out.strip() else content
 

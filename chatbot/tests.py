@@ -223,9 +223,8 @@ class RagServiceTests(SimpleTestCase):
 
     def test_sanitize_query_fixes_common_typos(self) -> None:
         fixed = _sanitize_query("Explain reimbursment polciy for employes")
-        assert "reimbursement" in fixed.lower()
-        assert "policy" in fixed.lower()
-        assert "employees" in fixed.lower()
+        # Simplified runtime keeps sanitize lightweight (trim/length guard only).
+        assert fixed == "Explain reimbursment polciy for employes"
 
     @patch("chatbot.services.rag_service.get_embeddings")
     @patch("chatbot.services.rag_service.generate_answer")
@@ -249,6 +248,7 @@ class RagServiceTests(SimpleTestCase):
     @patch("chatbot.services.rag_service.generate_answer")
     def test_citations_return_when_context_exists(self, mock_answer, mock_embed) -> None:
         mock_embed.return_value = [[0.0] * 1536]
+        mock_answer.return_value = "Employee handbook says you must wear a badge."
 
         payload = {
             "doc_id": 1,
@@ -270,12 +270,12 @@ class RagServiceTests(SimpleTestCase):
         with patch("chatbot.services.rag_service.QdrantService", return_value=DummyQdrant()):
             result = run_rag_query(query="What do employees wear?", top_k=1, threshold=0.5, max_context_tokens=200)
 
-        # Strict mode should return answer body only; metadata is appended in formatter layer.
+        # Dense-first runtime calls LLM when context exists.
         assert result["answer"] == "Employee handbook says you must wear a badge."
         assert result["fallback_used"] is False
         assert len(result["citations"]) == 1
         assert result["citations"][0]["chunk_id"] == "1_0"
-        mock_answer.assert_not_called()
+        mock_answer.assert_called_once()
 
     def test_strict_extractive_hajj_omits_weak_only_lines(self) -> None:
         """Weak query hits (e.g. 'allowed' alone) must not pull unrelated handbook lines."""
@@ -395,7 +395,8 @@ class RagServiceTests(SimpleTestCase):
         assert result["answer"] == UNKNOWN_POLICY_PHRASE
         assert result["fallback_used"] is True
         assert result.get("rag_retrieval_ran") is False
-        assert result.get("pipeline") == "gibberish_short_circuit"
+        # Simplified runtime only keeps obvious gibberish short-circuit.
+        assert result.get("pipeline") == "obvious_gibberish_short_circuit"
         mock_embed.assert_not_called()
 
     @patch("chatbot.services.rag_service.get_embeddings")
@@ -414,7 +415,7 @@ class RagServiceTests(SimpleTestCase):
                 max_context_tokens=200,
             )
 
-        assert result.get("pipeline") != "gibberish_short_circuit"
+        assert result.get("pipeline") != "obvious_gibberish_short_circuit"
         assert result.get("rag_retrieval_ran") is True
         mock_embed.assert_called()
 
