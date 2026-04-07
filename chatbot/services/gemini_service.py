@@ -172,7 +172,6 @@ def _kw(text: str) -> set[str]:
         "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are",
         "be", "this", "that", "it", "as", "at", "by", "from", "what", "how", "when", "where",
         "which", "who", "why", "does", "do", "did", "can", "could", "should", "would", "about",
-        "policy", "policies", "employee", "employees",
     }
     return {t for t in toks if len(t) >= 3 and t not in stop}
 
@@ -181,19 +180,33 @@ def _topic_focused_chunks(question: str, chunks: List[Dict[str, Any]], *, max_ch
     q = _kw(question)
     if not q:
         return chunks[:max_chunks]
+    # For handbook domains, these anchors are critical for topic routing and should
+    # always contribute to overlap scoring when present in the query.
+    domain_anchors = {
+        t
+        for t in re.findall(r"[a-zA-Z0-9]+", question.lower())
+        if t in {
+            "policy", "policies", "employee", "employees", "reimbursement",
+            "certification", "certifications", "leave", "benefits", "scope", "purpose",
+        }
+    }
+    q = q.union(domain_anchors)
     scored = []
     for c in chunks:
         text = str(c.get("text") or "")
         sec = str(c.get("source_section") or "")
         terms = _kw(f"{sec} {text}")
+        # Prefer section-title alignment strongly so nearby unrelated policies are less likely.
+        sec_terms = _kw(sec)
         ov = len(q.intersection(terms))
+        sec_ov = len(q.intersection(sec_terms))
         if ov <= 0:
             continue
-        scored.append((ov, c))
+        scored.append((sec_ov, ov, c))
     if not scored:
         return chunks[:max_chunks]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _ov, c in scored[:max(1, max_chunks)]]
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [c for _sec_ov, _ov, c in scored[:max(1, max_chunks)]]
 
 
 def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
@@ -332,7 +345,10 @@ def generate_answer(
         "3) Do NOT use markdown symbols such as * or **.\n"
         "4) Do not include unrelated policies or sections — only what answers the question.\n"
         "5) Every point must be full, grammatically complete sentences — no mid-sentence fragments.\n"
-        "6) Output only the answer body. Do not add a Sources section.\n"
+        "6) Every numbered point MUST end with an evidence tag using the exact chunk number, e.g. [Chunk 2].\n"
+        "7) Use only chunk numbers that appear in Context. Do not invent chunk IDs.\n"
+        "8) If a point cannot be grounded in a chunk, do not include that point.\n"
+        "9) Output only the answer body. Do not add a Sources section.\n"
     )
 
     extra_headers = {
