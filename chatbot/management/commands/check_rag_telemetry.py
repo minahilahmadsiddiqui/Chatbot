@@ -37,7 +37,7 @@ class Command(BaseCommand):
             raise CommandError("No telemetry rows found.")
         win = max(10, int(opts.get("window") or 200))
         recent = rows[-win:]
-        min_samples = int(getattr(settings, "RAG_REGRESSION_ALERT_MIN_SAMPLES", 50))
+        min_samples = int(getattr(settings, "RAG_REGRESSION_ALERT_MIN_SAMPLES", 30))
         if len(recent) < min_samples:
             self.stdout.write(
                 json.dumps(

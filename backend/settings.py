@@ -36,10 +36,10 @@ OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost:8000")
 OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "chatbot-backend")
 
 # OpenRouter model defaults (override via env vars when deploying).
-OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")
-OPENROUTER_EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "qwen/qwen3.6-plus:free")
+OPENROUTER_EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
 OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "1024"))
-OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.2"))
+OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.1"))
 # Seconds for each OpenRouter HTTP call (prevents indefinite hangs; raise if answers truncate often).
 OPENROUTER_HTTP_TIMEOUT_SEC = float(os.getenv("OPENROUTER_HTTP_TIMEOUT_SEC", "120"))
 # Embeddings can hit upstream 408s; allow a longer client read timeout than chat.
@@ -49,7 +49,7 @@ OPENROUTER_MAX_CONTINUATIONS = int(os.getenv("OPENROUTER_MAX_CONTINUATIONS", "1"
 # Optional second pass: shorten the chat model's answer (same or separate model).
 OPENROUTER_SUMMARY_MODEL = os.getenv("OPENROUTER_SUMMARY_MODEL", "").strip() or None
 OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_SUMMARY_MAX_OUTPUT_TOKENS", "384"))
-RAG_LLM_POST_SUMMARY = os.getenv("RAG_LLM_POST_SUMMARY", "1").strip().lower() in {
+RAG_LLM_POST_SUMMARY = os.getenv("RAG_LLM_POST_SUMMARY", "0").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -60,7 +60,7 @@ RAG_LLM_POST_SUMMARY = os.getenv("RAG_LLM_POST_SUMMARY", "1").strip().lower() in
 RAG_SUMMARIZE_MIN_INPUT_CHARS = int(os.getenv("RAG_SUMMARIZE_MIN_INPUT_CHARS", "200"))
 
 # RAG defaults
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
 # Dense cosine-style similarity floor (lower = more recall).
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.15"))
 # Keep chunks scoring at least this fraction of the best dense hit (improves recall).
@@ -73,25 +73,25 @@ RAG_SEMANTIC_SCORE_LOWER_IS_BETTER = os.getenv("RAG_SEMANTIC_SCORE_LOWER_IS_BETT
     "y",
     "on",
 }
-RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "3200"))
+RAG_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "2800"))
 # When packing context, skip a tiny tail smaller than this (tokens) unless it is the first chunk.
 RAG_CONTEXT_MIN_TAIL_TOKENS = int(os.getenv("RAG_CONTEXT_MIN_TAIL_TOKENS", "100"))
 # Dense search pool size = max(top_k * multiplier, min_below).
 RAG_SEMANTIC_CANDIDATE_MULTIPLIER = int(os.getenv("RAG_SEMANTIC_CANDIDATE_MULTIPLIER", "16"))
 RAG_SEMANTIC_CANDIDATE_MIN = int(os.getenv("RAG_SEMANTIC_CANDIDATE_MIN", "96"))
-RAG_INGEST_CHUNK_SIZE_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_SIZE_TOKENS", "500"))
-RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS", "75"))
+RAG_INGEST_CHUNK_SIZE_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_SIZE_TOKENS", "420"))
+RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS", "80"))
 # Lexical channel: scroll page size and max total points (large values slow each request).
 RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
 RAG_LEXICAL_MAX_POINTS = int(os.getenv("RAG_LEXICAL_MAX_POINTS", "1200"))
 # Always merge at least this many top RRF rows into context (deduped by chunk).
 RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "3"))
 # Additional RRF union slots relative to top_k (kept small to reduce weak tails).
-RAG_RRF_UNION_MULTIPLIER = int(os.getenv("RAG_RRF_UNION_MULTIPLIER", "1"))
+RAG_RRF_UNION_MULTIPLIER = int(os.getenv("RAG_RRF_UNION_MULTIPLIER", "4"))
 # Reciprocal rank fusion k (standard ~60). Merges dense + BM25 lists every query.
 RAG_HYBRID_RRF_K = int(os.getenv("RAG_HYBRID_RRF_K", "60"))
 # Min BM25 score for a lexical-only hit to pass the filter.
-RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.55"))
+RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.35"))
 # If true, block some queries as "gibberish" BEFORE embeddings/Qdrant (can false-positive real HR questions).
 RAG_ENABLE_GIBBERISH_FILTER = os.getenv("RAG_ENABLE_GIBBERISH_FILTER", "0").strip().lower() in {
     "1",
@@ -106,12 +106,12 @@ RAG_ENABLE_GIBBERISH_FILTER = os.getenv("RAG_ENABLE_GIBBERISH_FILTER", "0").stri
 # - When disabled, the LLM can paraphrase (higher fluency, lower guarantee).
 RAG_STRICT_NO_HALLUCINATE = os.getenv("RAG_STRICT_NO_HALLUCINATE", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
 # Sentences selected for strict extractive answers (embedding-ranked).
-RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "6"))
+RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "5"))
 # How many cleaned sentences to join into the main paragraph (can be > selection count).
 RAG_STRICT_ANSWER_BODY_SENTENCES = int(os.getenv("RAG_STRICT_ANSWER_BODY_SENTENCES", "8"))
-RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "1100"))
-RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "1800"))
-RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "2"))
+RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "1800"))
+RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "2800"))
+RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "3"))
 # Drop strict-mode chunks whose context BM25 is below this fraction of the best chunk (0 = off).
 RAG_STRICT_BM25_RELATIVE_FLOOR = float(os.getenv("RAG_STRICT_BM25_RELATIVE_FLOOR", "0.12"))
 # Prefer lines that match query terms (fewer unrelated policy paragraphs in the answer).
@@ -132,14 +132,16 @@ RAG_STRICT_FALLBACK_TO_LLM = os.getenv("RAG_STRICT_FALLBACK_TO_LLM", "0").strip(
 }
 # If false, strict mode does not widen into broad non-focused paragraph assembly.
 RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK = os.getenv(
-    "RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK", "0"
+    "RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK", "1"
 ).strip().lower() in {"1", "true", "yes", "y", "on"}
 # Query-focused extraction includes +/- this many lines around each anchor hit.
 RAG_STRICT_ANCHOR_WINDOW_LINES = int(os.getenv("RAG_STRICT_ANCHOR_WINDOW_LINES", "1"))
+# Minimum query-term overlap required for strict sentence extraction.
+RAG_STRICT_MIN_SENTENCE_OVERLAP = int(os.getenv("RAG_STRICT_MIN_SENTENCE_OVERLAP", "2"))
 # Max bullet lines in strict sentence fallback.
 RAG_STRICT_EXTRACTIVE_MAX_BULLETS = int(os.getenv("RAG_STRICT_EXTRACTIVE_MAX_BULLETS", "10"))
 # Calibrated abstention gate: minimum score required to answer from retrieved context.
-RAG_MIN_ANSWERABILITY_SCORE = float(os.getenv("RAG_MIN_ANSWERABILITY_SCORE", "0.35"))
+RAG_MIN_ANSWERABILITY_SCORE = float(os.getenv("RAG_MIN_ANSWERABILITY_SCORE", "0.42"))
 
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
@@ -149,7 +151,7 @@ RAG_ENABLE_CROSS_ENCODER_RERANK = os.getenv("RAG_ENABLE_CROSS_ENCODER_RERANK", "
     "1", "true", "yes", "y", "on"
 }
 RAG_CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-RAG_CROSS_ENCODER_TOP_N = int(os.getenv("RAG_CROSS_ENCODER_TOP_N", "20"))
+RAG_CROSS_ENCODER_TOP_N = int(os.getenv("RAG_CROSS_ENCODER_TOP_N", "30"))
 RAG_ENABLE_LEXICAL_INDEX_CACHE = os.getenv("RAG_ENABLE_LEXICAL_INDEX_CACHE", "1").strip().lower() in {
     "1", "true", "yes", "y", "on"
 }

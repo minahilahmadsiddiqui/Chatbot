@@ -510,7 +510,7 @@ def _hybrid_filter_for_context(
         seen.add(k)
         merged.append(r)
 
-    rrf_mult = max(1, int(getattr(settings, "RAG_RRF_UNION_MULTIPLIER", 2)))
+    rrf_mult = max(1, int(getattr(settings, "RAG_RRF_UNION_MULTIPLIER", 4)))
     rrf_slots = max(int(getattr(settings, "RAG_RRF_MIN_GUARANTEE", 8)), top_k * rrf_mult)
     by_rrf = sorted(retrieved, key=lambda x: -float(x.get("_rrf", 0)))
     for r in by_rrf[:rrf_slots]:
@@ -1516,13 +1516,13 @@ def _extractive_answer_with_sources_from_context(
 
     strong_terms = _strong_focus_terms(q_terms)
 
-    min_overlap = int(getattr(settings, "RAG_STRICT_MIN_SENTENCE_OVERLAP", 1))
+    min_overlap = int(getattr(settings, "RAG_STRICT_MIN_SENTENCE_OVERLAP", 2))
     if len(q_terms) >= 8:
         min_overlap = max(min_overlap, 2)
     if len(q_terms) >= 3:
         min_overlap = max(min_overlap, 2)
 
-    max_chunks_for_body = int(getattr(settings, "RAG_STRICT_MAX_CHUNKS_FOR_BODY", 12))
+    max_chunks_for_body = int(getattr(settings, "RAG_STRICT_MAX_CHUNKS_FOR_BODY", 3))
     chunk_order: Dict[str, int] = {}
     for i, c in enumerate(context_chunks):
         cid = str(c.get("chunk_id") or "")
@@ -1550,7 +1550,7 @@ def _extractive_answer_with_sources_from_context(
             break
 
     before_bm_trim = list(selected_scored)
-    rel_floor = float(getattr(settings, "RAG_STRICT_BM25_RELATIVE_FLOOR", 0.0))
+    rel_floor = float(getattr(settings, "RAG_STRICT_BM25_RELATIVE_FLOOR", 0.25))
     if rel_floor > 0 and len(selected_scored) > 1:
         top_bm = max((s[0] for s in selected_scored), default=0.0)
         if top_bm > 1e-9:
@@ -1660,7 +1660,7 @@ def _validate_answer_sentences_supported(answer: str, context_chunks: List[Dict[
     evidence = _build_sentence_evidence(answer, context_chunks)
     if not answer.strip():
         return answer, []
-    required_overlap = int(getattr(settings, "RAG_SENTENCE_EVIDENCE_MIN_OVERLAP", 2))
+    required_overlap = int(getattr(settings, "RAG_SENTENCE_EVIDENCE_MIN_OVERLAP", 1))
     good_sentences = []
     good_evidence: List[Dict[str, Any]] = []
     by_sentence = {str(e.get("sentence") or "").strip(): e for e in evidence}
@@ -1837,7 +1837,7 @@ def _manual_pipeline(
             }
 
         if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
-            max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 4))
+            max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 5))
             if ab_variant == "treatment":
                 max_sentences = max(2, min(max_sentences, 3))
             extracted_answer, used_chunks = _extractive_answer_with_sources_from_context(
@@ -1963,7 +1963,7 @@ def run_rag_query(
     Runs the RAG flow. Uses LangGraph when installed; otherwise falls back to
     a manual orchestration so the service stays functional during setup.
     """
-    top_k = top_k if top_k is not None else getattr(settings, "RAG_TOP_K", 5)
+    top_k = top_k if top_k is not None else getattr(settings, "RAG_TOP_K", 6)
     threshold = threshold if threshold is not None else getattr(settings, "RAG_SIMILARITY_THRESHOLD", 0.3)
     max_context_tokens = (
         max_context_tokens if max_context_tokens is not None else getattr(settings, "RAG_MAX_CONTEXT_TOKENS", 1600)
@@ -2074,7 +2074,7 @@ def run_rag_query(
         # Strict mode: answer is built from verbatim sentences in retrieved chunks.
         # This removes paraphrase-based hallucinations as much as possible.
         if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
-            max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 4))
+            max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 5))
             if ab_variant == "treatment":
                 max_sentences = max(2, min(max_sentences, 3))
             extracted_answer, used_chunks = _extractive_answer_with_sources_from_context(

@@ -69,7 +69,7 @@ def cross_encoder_healthcheck() -> Dict[str, Any]:
         elapsed_ms = int((time.time() - t0) * 1000)
         return {
             "ready": True,
-            "model": str(getattr(settings, "RAG_CROSS_ENCODER_MODEL", "")),
+            "model": str(getattr(settings, "RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")),
             "elapsed_ms": elapsed_ms,
             "sample_scores": [float(s) for s in list(scores)[:2]],
         }

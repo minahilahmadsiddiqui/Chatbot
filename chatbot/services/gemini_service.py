@@ -166,6 +166,36 @@ def _strip_trailing_sources_block(text: str) -> str:
     return t
 
 
+def _kw(text: str) -> set[str]:
+    toks = {t.lower() for t in re.findall(r"[a-zA-Z0-9]+", text or "")}
+    stop = {
+        "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are",
+        "be", "this", "that", "it", "as", "at", "by", "from", "what", "how", "when", "where",
+        "which", "who", "why", "does", "do", "did", "can", "could", "should", "would", "about",
+        "policy", "policies", "employee", "employees",
+    }
+    return {t for t in toks if len(t) >= 3 and t not in stop}
+
+
+def _topic_focused_chunks(question: str, chunks: List[Dict[str, Any]], *, max_chunks: int = 5) -> List[Dict[str, Any]]:
+    q = _kw(question)
+    if not q:
+        return chunks[:max_chunks]
+    scored = []
+    for c in chunks:
+        text = str(c.get("text") or "")
+        sec = str(c.get("source_section") or "")
+        terms = _kw(f"{sec} {text}")
+        ov = len(q.intersection(terms))
+        if ov <= 0:
+            continue
+        scored.append((ov, c))
+    if not scored:
+        return chunks[:max_chunks]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _ov, c in scored[:max(1, max_chunks)]]
+
+
 def summarize_llm_answer_for_display(*, question: str, draft_body: str) -> str:
     """
     Second LLM call: produce a shorter version of the answer while keeping the same facts.
@@ -241,10 +271,15 @@ def generate_answer(
 
     # Keep the prompt tight and explicit; prefer grounded answers over fallback
     # when there is any relevant information in the context.
+    focused_chunks = _topic_focused_chunks(
+        question,
+        context_chunks,
+        max_chunks=int(getattr(settings, "RAG_LLM_FOCUSED_CONTEXT_CHUNKS", 5)),
+    )
     context_text = "\n\n".join(
         [
-            f"[Chunk {i + 1}] {c.get('text', '')}".strip()
-            for i, c in enumerate(context_chunks)
+            f"[Chunk {i + 1} | Section: {str(c.get('source_section') or '').strip()} | Page: {str(c.get('page_number') or '').strip()}] {c.get('text', '')}".strip()
+            for i, c in enumerate(focused_chunks)
             if c.get("text")
         ]
     )
@@ -260,12 +295,15 @@ def generate_answer(
             "You are an employee handbook assistant.\n"
             + concise
             + "The user question should be answered using ONLY the provided Context excerpts.\n"
+            "Use ONLY excerpts that match the same topic as the user question.\n"
+            "Ignore excerpts that are from other policies, even if they look well-formed.\n"
+            "Do NOT merge multiple unrelated policies into one answer.\n"
             "If the excerpts contain ANY information that reasonably addresses the question "
             "(even partial, or spread across chunks), summarize that information clearly.\n"
             "Do not invent facts that are not supported by the Context.\n"
             f"Use the exact phrase \"{UNKNOWN_POLICY_PHRASE}\" ONLY when the excerpts do not "
             "contain relevant information for the question at all.\n"
-            "Prefer quoting or paraphrasing closely from the excerpts; cite [Chunk N] in Sources.\n"
+            "Prefer quoting or paraphrasing closely from the excerpts.\n"
             "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
         )
     else:
@@ -273,6 +311,8 @@ def generate_answer(
             "You are an employee handbook assistant.\n"
             + concise
             + "Answer ONLY from the provided handbook excerpts.\n"
+            "Use ONLY excerpts that match the question topic; ignore unrelated policies.\n"
+            "Do NOT stitch text from different policy topics.\n"
             "Never invent or infer company policy.\n"
             f"If the handbook does not explicitly mention the policy, respond with exactly: \"{UNKNOWN_POLICY_PHRASE}\".\n"
             "Do not answer using loosely related policies.\n"
@@ -292,7 +332,7 @@ def generate_answer(
         "3) Do NOT use markdown symbols such as * or **.\n"
         "4) Do not include unrelated policies or sections — only what answers the question.\n"
         "5) Every point must be full, grammatically complete sentences — no mid-sentence fragments.\n"
-        "6) After the answer, add a `Sources:` section listing which [Chunk N] excerpts you relied on.\n"
+        "6) Output only the answer body. Do not add a Sources section.\n"
     )
 
     extra_headers = {
