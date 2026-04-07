@@ -10,6 +10,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.views.decorators.csrf import csrf_exempt
+from openai import APIStatusError, AuthenticationError
 
 from chatbot.models import ChatMessage, Document
 from chatbot.services.embeddings_service import get_embeddings
@@ -21,6 +22,7 @@ from chatbot.services.response_beautify_service import (
 )
 from chatbot.services.gemini_service import ensure_raw_answer_log_dir
 from chatbot.services.rag_service import FALLBACK_PHRASE, run_rag_query
+from chatbot.services.telemetry_service import append_rag_telemetry
 from chatbot.services.text_splitter import (
     handbook_has_auto_structure,
     handbook_has_section_markers,
@@ -244,6 +246,21 @@ def upload_document(request):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if isinstance(e, AuthenticationError) or (
+            isinstance(e, APIStatusError) and getattr(e, "status_code", None) == 401
+        ):
+            return Response(
+                {
+                    "error": "Embedding API authentication failed (401).",
+                    "details": msg,
+                    "hint": (
+                        "Set a valid OPENROUTER_API_KEY in .env (OpenRouter: "
+                        "https://openrouter.ai/keys). Invalid, expired, or revoked keys "
+                        'return "User not found" from the provider.'
+                    ),
+                },
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
         raise
 
     return Response(
@@ -340,7 +357,7 @@ def chat_query(request):
 
     ensure_raw_answer_log_dir()
     t0 = time.time()
-    result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f)
+    result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f, session_id=str(session_id))
     latency_ms = int((time.time() - t0) * 1000)
 
     retrieved = result.get("retrieved") or []
@@ -370,6 +387,17 @@ def chat_query(request):
         latency_ms=latency_ms,
         fallback_used=bool(result.get("fallback_used")),
     )
+    append_rag_telemetry(
+        {
+            "session_id": str(session_id),
+            "query": str(query),
+            "ab_variant": result.get("ab_variant"),
+            "pipeline": result.get("pipeline"),
+            "fallback_used": bool(result.get("fallback_used")),
+            "latency_ms": latency_ms,
+            "retrieval_diagnostics": result.get("retrieval_diagnostics") or {},
+        }
+    )
 
     return Response(
         {
@@ -380,6 +408,9 @@ def chat_query(request):
             "fallback_used": bool(result.get("fallback_used")),
             "retrieved": retrieved,
             "citations": citations,
+            "retrieval_diagnostics": result.get("retrieval_diagnostics") or {},
+            "sentence_evidence": result.get("sentence_evidence") or [],
+            "ab_variant": result.get("ab_variant"),
             "latency_ms": latency_ms,
             "top_k": result.get("top_k"),
             "threshold": result.get("threshold"),
@@ -410,7 +441,7 @@ def chat_query_stream(request):
         return Response({"error": "Invalid 'top_k' or 'threshold' types."}, status=status.HTTP_400_BAD_REQUEST)
 
     ensure_raw_answer_log_dir()
-    result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f)
+    result = run_rag_query(query=query, top_k=top_k_int, threshold=threshold_f, session_id=str(session_id))
     citations = result.get("citations") or []
     top_k_used = result.get("top_k")
     threshold_used = result.get("threshold")
@@ -443,6 +474,17 @@ def chat_query_stream(request):
         latency_ms=int(result.get("latency_ms") or 0),
         fallback_used=bool(result.get("fallback_used")),
     )
+    append_rag_telemetry(
+        {
+            "session_id": str(session_id),
+            "query": str(query),
+            "ab_variant": result.get("ab_variant"),
+            "pipeline": result.get("pipeline"),
+            "fallback_used": bool(result.get("fallback_used")),
+            "latency_ms": int(result.get("latency_ms") or 0),
+            "retrieval_diagnostics": result.get("retrieval_diagnostics") or {},
+        }
+    )
 
     def event_stream():
         # Minimal SSE envelope; frontend can render as it arrives.
@@ -451,7 +493,7 @@ def chat_query_stream(request):
         yield f"event: answer\ndata: {json.dumps(answer)}\n\n"
         yield f"event: answer_html\ndata: {json.dumps(answer_html)}\n\n"
         yield f"event: citations\ndata: {json.dumps(citations)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used, 'rag_retrieval_ran': result.get('rag_retrieval_ran'), 'pipeline': result.get('pipeline')})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'top_k': top_k_used, 'threshold': threshold_used, 'rag_retrieval_ran': result.get('rag_retrieval_ran'), 'pipeline': result.get('pipeline'), 'retrieval_diagnostics': result.get('retrieval_diagnostics') or {}, 'sentence_evidence': result.get('sentence_evidence') or [], 'ab_variant': result.get('ab_variant')})}\n\n"
 
     response = StreamingHttpResponse(
         event_stream(),

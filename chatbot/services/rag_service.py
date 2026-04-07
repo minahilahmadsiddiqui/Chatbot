@@ -5,17 +5,20 @@ import time
 import re
 import math
 import difflib
+import hashlib
 from typing import Any, Dict, List, Optional, TypedDict
 
 from django.conf import settings
 
 from chatbot.services.embeddings_service import get_embeddings
+from chatbot.services.cross_encoder_service import rerank_with_cross_encoder
 from chatbot.services.gemini_service import (
     UNKNOWN_POLICY_PHRASE,
     append_raw_answer_before_ui_processing,
     generate_answer,
 )
 from chatbot.services.qdrant_service import QdrantService
+from chatbot.services.lexical_index_service import sparse_lexical_candidates
 from chatbot.services.text_splitter import count_tokens, line_looks_like_toc_leader, truncate_text_to_token_budget
 
 logger = logging.getLogger(__name__)
@@ -177,6 +180,7 @@ class RagState(TypedDict, total=False):
     answer: str
     fallback_used: bool
     latency_ms: int
+    sentence_evidence: List[Dict[str, Any]]
 
 
 def _sanitize_query(query: str) -> str:
@@ -442,8 +446,9 @@ def _hybrid_filter_for_context(
 
     bm25_min = float(getattr(settings, "RAG_LEXICAL_BM25_MIN", 0.0))
     query_terms = _retrieval_terms(query)
+    strong_terms = _strong_focus_terms(query_terms)
     # For longer queries, require stronger lexical agreement to reduce noisy chunk admission.
-    min_lexical_overlap = 2 if len(query_terms) >= 8 else 1
+    min_lexical_overlap = 2 if len(query_terms) >= 3 else 1
 
     sem_scores: List[float] = []
     for r in retrieved:
@@ -483,7 +488,16 @@ def _hybrid_filter_for_context(
         sem_ok = passes_semantic(sem_f) if sem_f is not None else False
         ov = int(r.get("_overlap") or 0)
         bm25 = float(r.get("_bm25") or 0)
+        payload = r.get("payload") or {}
+        text = str(payload.get("text") or "")
+        sec = str(payload.get("source_section") or "")
+        combined_terms = _tokenize_keywords(text) | _tokenize_keywords(sec)
+        strong_overlap = len(strong_terms.intersection(combined_terms))
         lex_ok = bm25 > bm25_min and ov >= min_lexical_overlap
+        if strong_terms and strong_overlap <= 0:
+            lex_ok = False
+            # In precision mode, semantic hits without strong-topic overlap are also dropped.
+            sem_ok = False
         if sem_ok or lex_ok:
             primary.append(r)
 
@@ -496,7 +510,8 @@ def _hybrid_filter_for_context(
         seen.add(k)
         merged.append(r)
 
-    rrf_slots = max(int(getattr(settings, "RAG_RRF_MIN_GUARANTEE", 18)), top_k * 3)
+    rrf_mult = max(1, int(getattr(settings, "RAG_RRF_UNION_MULTIPLIER", 2)))
+    rrf_slots = max(int(getattr(settings, "RAG_RRF_MIN_GUARANTEE", 8)), top_k * rrf_mult)
     by_rrf = sorted(retrieved, key=lambda x: -float(x.get("_rrf", 0)))
     for r in by_rrf[:rrf_slots]:
         k = _retrieved_row_chunk_key(r)
@@ -779,6 +794,7 @@ def _strict_body_query_focused(
         raw_lines = [ln for ln in str(c.get("text") or "").splitlines() if ln.strip()]
         block_src = _expand_query_focus_lines(raw_lines, terms, strong)
         block = _filter_to_complete_sentences(_clean_extractive_sentence(" ".join(block_src)).strip(" -•*"))
+        block = _filter_block_to_anchor_sentences(block, terms=terms, strong_terms=strong)
         if not block:
             continue
         add = len(block) + (1 if parts else 0)
@@ -938,6 +954,32 @@ def _filter_to_complete_sentences(text: str) -> str:
     return " ".join(kept) if kept else t
 
 
+def _filter_block_to_anchor_sentences(text: str, *, terms: set[str], strong_terms: set[str]) -> str:
+    """
+    Keep only sentences that still align with query anchors.
+    This trims unrelated neighbors that slipped into the extracted block.
+    """
+    t = _filter_to_complete_sentences(text)
+    if not t:
+        return ""
+    segs = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+    if not segs:
+        return ""
+    strong = strong_terms if strong_terms else _strong_focus_terms(terms)
+    kept: List[str] = []
+    for s in segs:
+        s_terms = _tokenize_keywords(s)
+        if not s_terms:
+            continue
+        overlap = len(terms.intersection(s_terms))
+        if overlap <= 0:
+            continue
+        if strong and not (strong.intersection(s_terms)) and overlap < 2:
+            continue
+        kept.append(s)
+    return " ".join(kept).strip()
+
+
 def _expand_query_focus_lines(
     raw_lines: List[str],
     terms: set[str],
@@ -957,9 +999,21 @@ def _expand_query_focus_lines(
     match = [_line_matches_focus_for_expansion(ln, terms, strong) for ln in cleaned]
     if not any(match):
         return cleaned
-    first = min(i for i, m in enumerate(match) if m)
-    last = max(i for i, m in enumerate(match) if m)
-    return cleaned[first : last + 1]
+    # Precision mode: keep small windows around each anchor line instead of one
+    # broad first..last span that can pull unrelated middle text.
+    win = max(0, int(getattr(settings, "RAG_STRICT_ANCHOR_WINDOW_LINES", 1)))
+    idxs = [i for i, m in enumerate(match) if m]
+    out: List[str] = []
+    seen_idx: set[int] = set()
+    for i in idxs:
+        start = max(0, i - win)
+        end = min(len(cleaned), i + win + 1)
+        for j in range(start, end):
+            if j in seen_idx:
+                continue
+            seen_idx.add(j)
+            out.append(cleaned[j])
+    return out
 
 
 def _section_label_plausible_for_chunk(sec: str, chunk_text: str) -> bool:
@@ -1117,6 +1171,93 @@ def _rerank_by_query_overlap(query: str, items: List[Dict[str, Any]]) -> List[Di
     return sorted(items, key=rank_key, reverse=True)
 
 
+def _stage2_precision_rerank(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Second-stage precision reranker over fused candidates.
+    Uses strong-term overlap as primary key, then lexical/semantic evidence.
+    """
+    if not items:
+        return []
+    terms = _retrieval_terms(query)
+    strong = _strong_focus_terms(set(terms))
+
+    def score(item: Dict[str, Any]) -> tuple[int, int, int, float, float, float]:
+        payload = item.get("payload") or {}
+        text = str(payload.get("text") or "")
+        sec = str(payload.get("source_section") or "")
+        tterms = _tokenize_keywords(text) | _tokenize_keywords(sec)
+        strong_ov = len(strong.intersection(tterms)) if strong else 0
+        all_ov = len(set(terms).intersection(tterms))
+        phrase_hits = sum(1 for a in terms if a in text.lower() or a in sec.lower())
+        bm25 = float(item.get("_bm25") or 0.0)
+        sem = float(item.get("score") or 0.0)
+        rrf = float(item.get("_rrf") or 0.0)
+        return (strong_ov, all_ov, phrase_hits, bm25, sem, rrf)
+
+    ranked = sorted(items, key=score, reverse=True)
+    if bool(getattr(settings, "RAG_ENABLE_CROSS_ENCODER_RERANK", False)):
+        top_n = int(getattr(settings, "RAG_CROSS_ENCODER_TOP_N", 20))
+        ranked = rerank_with_cross_encoder(query=query, items=ranked, top_n=top_n)
+    return ranked
+
+
+def _compute_answerability(
+    *,
+    query: str,
+    filtered: List[Dict[str, Any]],
+    context_chunks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Lightweight calibrated confidence for answerability from retrieved context.
+    """
+    terms = _retrieval_terms(query)
+    strong = _strong_focus_terms(set(terms))
+    top_sem = 0.0
+    top_bm25 = 0.0
+    top_rrf = 0.0
+    for r in filtered[:5]:
+        try:
+            top_sem = max(top_sem, float(r.get("score") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            top_bm25 = max(top_bm25, float(r.get("_bm25") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            top_rrf = max(top_rrf, float(r.get("_rrf") or 0.0))
+        except (TypeError, ValueError):
+            pass
+
+    ctx_terms: set[str] = set()
+    for c in context_chunks:
+        ctx_terms |= _tokenize_keywords(str(c.get("text") or ""))
+        ctx_terms |= _tokenize_keywords(str(c.get("source_section") or ""))
+    all_overlap = len(set(terms).intersection(ctx_terms))
+    strong_overlap = len(strong.intersection(ctx_terms)) if strong else 0
+
+    strong_hit = 1.0 if (strong_overlap >= 1 or not strong) else 0.0
+    overlap_norm = min(1.0, all_overlap / max(2.0, float(len(set(terms)) or 1)))
+    sem_norm = min(1.0, top_sem) if top_sem > 0 else 0.0
+    bm25_norm = min(1.0, top_bm25 / 3.0) if top_bm25 > 0 else 0.0
+    rrf_norm = min(1.0, top_rrf * 120.0) if top_rrf > 0 else 0.0
+    score = (
+        0.34 * strong_hit
+        + 0.26 * overlap_norm
+        + 0.20 * sem_norm
+        + 0.12 * bm25_norm
+        + 0.08 * rrf_norm
+    )
+    return {
+        "score": round(float(score), 4),
+        "strong_overlap": int(strong_overlap),
+        "all_overlap": int(all_overlap),
+        "top_semantic": round(float(top_sem), 6),
+        "top_bm25": round(float(top_bm25), 6),
+        "top_rrf": round(float(top_rrf), 6),
+    }
+
+
 def _payload_from_scanned_point(p: Any) -> Optional[Dict[str, Any]]:
     if p is None:
         return None
@@ -1258,18 +1399,30 @@ def _hybrid_merge_semantic_and_lexical(
     keywords = _retrieval_terms(query)
     scan_fn = getattr(qdrant, "scan_payload_points", None)
     if keywords and callable(scan_fn):
-        per_page = int(getattr(settings, "RAG_LEXICAL_SCAN_LIMIT", 150))
-        max_points = int(getattr(settings, "RAG_LEXICAL_MAX_POINTS", 400))
-        try:
-            scanned = scan_fn(limit=per_page, max_points=max_points)
-        except Exception:
-            scanned = []
-        lexical_top = max(top_k * 6, 36)
-        lexical_items = _lexical_candidates_bm25(
-            query=query,
-            scanned_points=scanned or [],
-            top_n=lexical_top,
-        )
+        lexical_top = max(top_k * 4, 24)
+        if bool(getattr(settings, "RAG_ENABLE_SPARSE_LEXICAL_INDEX", True)):
+            lexical_items = sparse_lexical_candidates(qdrant=qdrant, query_terms=keywords, top_n=lexical_top)
+        elif bool(getattr(settings, "RAG_ENABLE_LEXICAL_INDEX_CACHE", True)):
+            from chatbot.services.lexical_index_service import get_lexical_rows
+
+            scanned = [{"payload": p} for p in get_lexical_rows(qdrant=qdrant)]
+            lexical_items = _lexical_candidates_bm25(
+                query=query,
+                scanned_points=scanned or [],
+                top_n=lexical_top,
+            )
+        else:
+            per_page = int(getattr(settings, "RAG_LEXICAL_SCAN_LIMIT", 150))
+            max_points = int(getattr(settings, "RAG_LEXICAL_MAX_POINTS", 1200))
+            try:
+                scanned = scan_fn(limit=per_page, max_points=max_points)
+            except Exception:
+                scanned = []
+            lexical_items = _lexical_candidates_bm25(
+                query=query,
+                scanned_points=scanned or [],
+                top_n=lexical_top,
+            )
 
     rrf_k = int(getattr(settings, "RAG_HYBRID_RRF_K", 60))
     return _hybrid_reciprocal_rank_fuse(semantic_items, lexical_items, rrf_k=rrf_k)
@@ -1350,7 +1503,7 @@ def _extractive_answer_with_sources_from_context(
     sentences by anchor overlap only — no embedding calls.
     Returns (answer_text, used_context_chunks).
     """
-    _ = (query_embedding, force_lexical_sentence_ranking, max_sentences)
+    _ = (query_embedding, force_lexical_sentence_ranking)
 
     # Match questions to chunks using broad retrieval terms (includes policy,
     # employee, reimbursement, etc.). Anchor-only matching was too strict and
@@ -1425,7 +1578,10 @@ def _extractive_answer_with_sources_from_context(
             respect_input_order=True,
         )
     min_focus_chars = max(48, min(200, body_char_cap // 40))
-    if len(answer_paragraph.strip()) < min_focus_chars:
+    if (
+        len(answer_paragraph.strip()) < min_focus_chars
+        and bool(getattr(settings, "RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK", False))
+    ):
         answer_paragraph = _strict_body_from_chunks_ordered(
             selected_chunks,
             max_chars=body_char_cap,
@@ -1448,6 +1604,12 @@ def _extractive_answer_with_sources_from_context(
     if ap_filtered.strip():
         answer_paragraph = ap_filtered
 
+    # Enforce caller cap; previously ignored and could emit long mixed passages.
+    if max_sentences > 0:
+        segs = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer_paragraph) if s.strip()]
+        if len(segs) > max_sentences:
+            answer_paragraph = " ".join(segs[:max_sentences]).strip()
+
     if answer_paragraph and not answer_paragraph.endswith("."):
         answer_paragraph += "."
 
@@ -1458,6 +1620,70 @@ def _extractive_answer_with_sources_from_context(
     return answer_paragraph.strip(), selected_chunks
 
 
+def _build_sentence_evidence(answer: str, context_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Bind each answer sentence to the best explicit supporting chunk.
+    """
+    if not answer or not context_chunks:
+        return []
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer) if s.strip()]
+    out: List[Dict[str, Any]] = []
+    for sent in parts:
+        s_terms = _tokenize_keywords(sent)
+        best = None
+        best_overlap = 0
+        for c in context_chunks:
+            text = str(c.get("text") or "")
+            terms = _tokenize_keywords(text)
+            ov = len(s_terms.intersection(terms))
+            if ov > best_overlap:
+                best_overlap = ov
+                best = c
+        if best is None or best_overlap <= 0:
+            continue
+        out.append(
+            {
+                "sentence": sent,
+                "chunk_id": best.get("chunk_id"),
+                "source_section": best.get("source_section"),
+                "page_number": best.get("page_number"),
+                "overlap_terms": best_overlap,
+            }
+        )
+    return out
+
+
+def _validate_answer_sentences_supported(answer: str, context_chunks: List[Dict[str, Any]]) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    Enforce sentence-level support. Unsupported sentences are removed.
+    """
+    evidence = _build_sentence_evidence(answer, context_chunks)
+    if not answer.strip():
+        return answer, []
+    required_overlap = int(getattr(settings, "RAG_SENTENCE_EVIDENCE_MIN_OVERLAP", 2))
+    good_sentences = []
+    good_evidence: List[Dict[str, Any]] = []
+    by_sentence = {str(e.get("sentence") or "").strip(): e for e in evidence}
+    for s in [x.strip() for x in re.split(r"(?<=[.!?])\s+", answer) if x.strip()]:
+        ev = by_sentence.get(s)
+        if not ev:
+            continue
+        if int(ev.get("overlap_terms") or 0) < required_overlap:
+            continue
+        good_sentences.append(s)
+        good_evidence.append(ev)
+    filtered = " ".join(good_sentences).strip()
+    return filtered, good_evidence
+
+
+def _resolve_ab_variant(session_id: str) -> str:
+    if not bool(getattr(settings, "RAG_AB_TEST_ENABLED", False)):
+        return "control"
+    sid = (session_id or "").strip() or "anonymous"
+    bucket = int(hashlib.sha256(sid.encode("utf-8")).hexdigest(), 16) % 2
+    return "treatment" if bucket == 1 else "control"
+
+
 def _should_use_extractive_fallback(question: str, context_chunks: List[Dict[str, Any]]) -> bool:
     """
     Use extractive fallback only when key terms from the question
@@ -1466,24 +1692,30 @@ def _should_use_extractive_fallback(question: str, context_chunks: List[Dict[str
     rterms = _retrieval_terms(question)
     if not rterms:
         return False
+    strong = _strong_focus_terms(set(rterms))
 
     context_terms: set[str] = set()
     for c in context_chunks:
         context_terms |= _tokenize_keywords(str(c.get("text") or ""))
 
-    overlap = len(rterms.intersection(context_terms))
-    return overlap >= 1
+    overlap = len(set(rterms).intersection(context_terms))
+    if strong:
+        return len(strong.intersection(context_terms)) >= 1
+    return overlap >= 2
 
 
 def _query_is_covered_by_context(question: str, context_chunks: List[Dict[str, Any]]) -> bool:
     rterms = _retrieval_terms(question)
     if not rterms:
         return False
+    strong = _strong_focus_terms(set(rterms))
     context_terms: set[str] = set()
     for c in context_chunks:
         context_terms |= _tokenize_keywords(str(c.get("text") or ""))
-    overlap = len(rterms.intersection(context_terms))
-    return overlap >= 1
+    overlap = len(set(rterms).intersection(context_terms))
+    if strong:
+        return len(strong.intersection(context_terms)) >= 1
+    return overlap >= 2
 
 
 def _answer_includes_question_anchors(answer_body: str, question: str) -> bool:
@@ -1532,6 +1764,7 @@ def _manual_pipeline(
     top_k: int,
     threshold: float,
     max_context_tokens: int,
+    ab_variant: str = "control",
 ) -> Dict[str, Any]:
     qdrant = QdrantService()
     t0 = time.time()
@@ -1561,15 +1794,23 @@ def _manual_pipeline(
             semantic_items=retrieved,
             top_k=top_k,
         )
+        local_threshold = threshold
+        if ab_variant == "treatment":
+            local_threshold = max(local_threshold, threshold + 0.03)
         filtered = _hybrid_filter_for_context(
             retrieved,
             query=sanitized,
             top_k=top_k,
-            threshold=threshold,
+            threshold=local_threshold,
         )
+        filtered = _stage2_precision_rerank(sanitized, filtered)
         filtered = _rerank_by_query_overlap(sanitized, filtered)
 
         context_chunks = _build_context(filtered, max_context_tokens=max_context_tokens)
+        ans_diag = _compute_answerability(query=sanitized, filtered=filtered, context_chunks=context_chunks)
+        min_ans = float(getattr(settings, "RAG_MIN_ANSWERABILITY_SCORE", 0.35))
+        if ans_diag["score"] < min_ans:
+            context_chunks = []
         if not context_chunks:
             latency_ms = int((time.time() - t0) * 1000)
             return {
@@ -1590,12 +1831,15 @@ def _manual_pipeline(
                 "citations": [],
                 "latency_ms": latency_ms,
                 "top_k": top_k,
-                "threshold": threshold,
+                "threshold": local_threshold,
+                "retrieval_diagnostics": ans_diag,
                 **_pipeline_fields(rag_retrieval_ran=True, pipeline="manual_rag_empty_context"),
             }
 
         if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
             max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 4))
+            if ab_variant == "treatment":
+                max_sentences = max(2, min(max_sentences, 3))
             extracted_answer, used_chunks = _extractive_answer_with_sources_from_context(
                 sanitized,
                 context_chunks,
@@ -1627,6 +1871,11 @@ def _manual_pipeline(
                 answer = extracted_answer
                 append_raw_answer_before_ui_processing(extracted_answer)
                 context_chunks = used_chunks
+            answer, sentence_evidence = _validate_answer_sentences_supported(answer, context_chunks)
+            if not answer.strip():
+                answer = UNKNOWN_POLICY_PHRASE
+                context_chunks = []
+                sentence_evidence = []
         else:
             answer = generate_answer(
                 question=sanitized,
@@ -1647,6 +1896,17 @@ def _manual_pipeline(
                 if extracted:
                     answer = extracted
                     append_raw_answer_before_ui_processing(extracted)
+            answer, sentence_evidence = _validate_answer_sentences_supported(answer, context_chunks)
+            if not answer.strip():
+                answer = UNKNOWN_POLICY_PHRASE
+                context_chunks = []
+                sentence_evidence = []
+        if "sentence_evidence" not in locals():
+            answer, sentence_evidence = _validate_answer_sentences_supported(answer, context_chunks)
+            if not answer.strip():
+                answer = UNKNOWN_POLICY_PHRASE
+                context_chunks = []
+                sentence_evidence = []
     except Exception:
         logger.exception("RAG manual pipeline failed")
         latency_ms = int((time.time() - t0) * 1000)
@@ -1682,6 +1942,11 @@ def _manual_pipeline(
         "latency_ms": latency_ms,
         "top_k": top_k,
         "threshold": threshold,
+        "retrieval_diagnostics": _compute_answerability(
+            query=sanitized, filtered=filtered, context_chunks=context_chunks
+        ),
+        "sentence_evidence": sentence_evidence,
+        "ab_variant": ab_variant,
         **_pipeline_fields(rag_retrieval_ran=True, pipeline="manual_rag"),
     }
 
@@ -1692,6 +1957,7 @@ def run_rag_query(
     top_k: Optional[int] = None,
     threshold: Optional[float] = None,
     max_context_tokens: Optional[int] = None,
+    session_id: str = "",
 ) -> Dict[str, Any]:
     """
     Runs the RAG flow. Uses LangGraph when installed; otherwise falls back to
@@ -1741,10 +2007,17 @@ def run_rag_query(
     if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
         max_context_tokens = getattr(settings, "RAG_STRICT_MAX_CONTEXT_TOKENS", max_context_tokens)
 
+    ab_variant = _resolve_ab_variant(session_id)
     try:
         from langgraph.graph import StateGraph, END  # type: ignore
     except Exception:
-        return _manual_pipeline(query=query, top_k=top_k, threshold=threshold, max_context_tokens=max_context_tokens)
+        return _manual_pipeline(
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            max_context_tokens=max_context_tokens,
+            ab_variant=ab_variant,
+        )
 
     # Build nodes.
     def sanitize_node(state: RagState) -> RagState:
@@ -1772,17 +2045,27 @@ def run_rag_query(
 
     def filter_context_node(state: RagState) -> RagState:
         retrieved = state.get("retrieved") or []
+        local_threshold = threshold
+        if ab_variant == "treatment":
+            local_threshold = max(local_threshold, threshold + 0.03)
         filtered = _hybrid_filter_for_context(
             retrieved,
             query=state["query"],
             top_k=top_k,
-            threshold=threshold,
+            threshold=local_threshold,
         )
+        filtered = _stage2_precision_rerank(state["query"], filtered)
         filtered = _rerank_by_query_overlap(state["query"], filtered)
         context_chunks = _build_context(filtered, max_context_tokens=max_context_tokens)
+        ans_diag = _compute_answerability(
+            query=state["query"], filtered=filtered, context_chunks=context_chunks
+        )
+        min_ans = float(getattr(settings, "RAG_MIN_ANSWERABILITY_SCORE", 0.35))
+        if ans_diag["score"] < min_ans:
+            return {"context_chunks": [], "fallback_used": True, "retrieved": filtered}
         if not context_chunks:
             return {"context_chunks": [], "fallback_used": True}
-        return {"context_chunks": context_chunks, "fallback_used": False}
+        return {"context_chunks": context_chunks, "fallback_used": False, "retrieved": filtered}
 
     def answer_node(state: RagState) -> RagState:
         context_chunks = state.get("context_chunks") or []
@@ -1792,6 +2075,8 @@ def run_rag_query(
         # This removes paraphrase-based hallucinations as much as possible.
         if getattr(settings, "RAG_STRICT_NO_HALLUCINATE", True):
             max_sentences = int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 4))
+            if ab_variant == "treatment":
+                max_sentences = max(2, min(max_sentences, 3))
             extracted_answer, used_chunks = _extractive_answer_with_sources_from_context(
                 question,
                 context_chunks,
@@ -1832,11 +2117,20 @@ def run_rag_query(
                     "fallback_used": True,
                     "context_chunks": [],
                 }
-            append_raw_answer_before_ui_processing(extracted_answer)
+            filtered_answer, sentence_evidence = _validate_answer_sentences_supported(extracted_answer, used_chunks)
+            if not filtered_answer.strip():
+                return {
+                    "answer": UNKNOWN_POLICY_PHRASE,
+                    "fallback_used": True,
+                    "context_chunks": [],
+                    "sentence_evidence": [],
+                }
+            append_raw_answer_before_ui_processing(filtered_answer)
             return {
-                "answer": extracted_answer,
+                "answer": filtered_answer,
                 "fallback_used": False,
                 "context_chunks": used_chunks,
+                "sentence_evidence": sentence_evidence,
             }
 
         answer = generate_answer(
@@ -1858,9 +2152,15 @@ def run_rag_query(
             if extracted:
                 answer = extracted
                 append_raw_answer_before_ui_processing(extracted)
+        answer, sentence_evidence = _validate_answer_sentences_supported(answer, context_chunks)
+        if not answer.strip():
+            answer = UNKNOWN_POLICY_PHRASE
+            context_chunks = []
+            sentence_evidence = []
         return {
             "answer": answer,
             "fallback_used": answer.strip() in {FALLBACK_PHRASE, UNKNOWN_POLICY_PHRASE},
+            "sentence_evidence": sentence_evidence,
         }
 
     def fallback_node(state: RagState) -> RagState:
@@ -1926,6 +2226,13 @@ def run_rag_query(
         "latency_ms": latency_ms,
         "top_k": top_k,
         "threshold": threshold,
+        "sentence_evidence": final_state.get("sentence_evidence") or [],
+        "ab_variant": ab_variant,
+        "retrieval_diagnostics": _compute_answerability(
+            query=str(final_state.get("query") or query),
+            filtered=final_state.get("retrieved") or [],
+            context_chunks=fchunks,
+        ),
         **_pipeline_fields(rag_retrieval_ran=True, pipeline=pipeline),
     }
 

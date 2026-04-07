@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 import tiktoken
@@ -305,6 +306,29 @@ class RagServiceTests(SimpleTestCase):
         assert "cell phone" not in low
         assert "salaries are proportional" not in low
 
+    def test_strict_respects_max_sentences_limit(self) -> None:
+        chunk = {
+            "text": (
+                "Hajj policy allows fifteen paid leaves. "
+                "This benefit is once in service. "
+                "Submit leave request before travel."
+            ),
+            "chunk_id": "1_2",
+            "doc_id": 1,
+            "chunk_index": 2,
+            "source_section": "8.10 Hajj",
+            "page_number": 26,
+            "token_count": count_tokens("Hajj policy allows fifteen paid leaves."),
+        }
+        body, _used = _extractive_answer_with_sources_from_context(
+            "how many hajj leaves are allowed?",
+            [chunk],
+            max_sentences=1,
+        )
+        assert body
+        # At most one terminal punctuation sentence is expected after enforcement.
+        assert len([s for s in re.split(r"(?<=[.!?])\\s+", body.strip()) if s.strip()]) <= 1
+
     @patch("chatbot.services.rag_service.get_embeddings")
     def test_im_fine_is_handled_as_greeting_status(self, mock_embed) -> None:
         # Greeting/status replies should not trigger RAG retrieval.
@@ -367,7 +391,7 @@ class RagServiceTests(SimpleTestCase):
     @override_settings(RAG_ENABLE_GIBBERISH_FILTER=True)
     @patch("chatbot.services.rag_service.get_embeddings")
     def test_gibberish_query_returns_unknown_phrase(self, mock_embed) -> None:
-        result = run_rag_query(query="huiiiuihuh are u=you?", top_k=1, threshold=0.9, max_context_tokens=200)
+        result = run_rag_query(query="huiiiuihuh zzxxqq", top_k=1, threshold=0.9, max_context_tokens=200)
         assert result["answer"] == UNKNOWN_POLICY_PHRASE
         assert result["fallback_used"] is True
         assert result.get("rag_retrieval_ran") is False

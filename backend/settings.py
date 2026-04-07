@@ -60,7 +60,7 @@ RAG_LLM_POST_SUMMARY = os.getenv("RAG_LLM_POST_SUMMARY", "1").strip().lower() in
 RAG_SUMMARIZE_MIN_INPUT_CHARS = int(os.getenv("RAG_SUMMARIZE_MIN_INPUT_CHARS", "200"))
 
 # RAG defaults
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 # Dense cosine-style similarity floor (lower = more recall).
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.15"))
 # Keep chunks scoring at least this fraction of the best dense hit (improves recall).
@@ -85,11 +85,13 @@ RAG_INGEST_CHUNK_OVERLAP_TOKENS = int(os.getenv("RAG_INGEST_CHUNK_OVERLAP_TOKENS
 RAG_LEXICAL_SCAN_LIMIT = int(os.getenv("RAG_LEXICAL_SCAN_LIMIT", "150"))
 RAG_LEXICAL_MAX_POINTS = int(os.getenv("RAG_LEXICAL_MAX_POINTS", "1200"))
 # Always merge at least this many top RRF rows into context (deduped by chunk).
-RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "8"))
+RAG_RRF_MIN_GUARANTEE = int(os.getenv("RAG_RRF_MIN_GUARANTEE", "3"))
+# Additional RRF union slots relative to top_k (kept small to reduce weak tails).
+RAG_RRF_UNION_MULTIPLIER = int(os.getenv("RAG_RRF_UNION_MULTIPLIER", "1"))
 # Reciprocal rank fusion k (standard ~60). Merges dense + BM25 lists every query.
 RAG_HYBRID_RRF_K = int(os.getenv("RAG_HYBRID_RRF_K", "60"))
 # Min BM25 score for a lexical-only hit to pass the filter.
-RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.25"))
+RAG_LEXICAL_BM25_MIN = float(os.getenv("RAG_LEXICAL_BM25_MIN", "0.55"))
 # If true, block some queries as "gibberish" BEFORE embeddings/Qdrant (can false-positive real HR questions).
 RAG_ENABLE_GIBBERISH_FILTER = os.getenv("RAG_ENABLE_GIBBERISH_FILTER", "0").strip().lower() in {
     "1",
@@ -107,9 +109,9 @@ RAG_STRICT_NO_HALLUCINATE = os.getenv("RAG_STRICT_NO_HALLUCINATE", "1").strip().
 RAG_STRICT_MAX_SENTENCES = int(os.getenv("RAG_STRICT_MAX_SENTENCES", "6"))
 # How many cleaned sentences to join into the main paragraph (can be > selection count).
 RAG_STRICT_ANSWER_BODY_SENTENCES = int(os.getenv("RAG_STRICT_ANSWER_BODY_SENTENCES", "8"))
-RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "1800"))
-RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "6000"))
-RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "4"))
+RAG_STRICT_MAX_CONTEXT_TOKENS = int(os.getenv("RAG_STRICT_MAX_CONTEXT_TOKENS", "1100"))
+RAG_STRICT_ANSWER_BODY_CHARS = int(os.getenv("RAG_STRICT_ANSWER_BODY_CHARS", "1800"))
+RAG_STRICT_MAX_CHUNKS_FOR_BODY = int(os.getenv("RAG_STRICT_MAX_CHUNKS_FOR_BODY", "2"))
 # Drop strict-mode chunks whose context BM25 is below this fraction of the best chunk (0 = off).
 RAG_STRICT_BM25_RELATIVE_FLOOR = float(os.getenv("RAG_STRICT_BM25_RELATIVE_FLOOR", "0.12"))
 # Prefer lines that match query terms (fewer unrelated policy paragraphs in the answer).
@@ -128,11 +130,41 @@ RAG_STRICT_FALLBACK_TO_LLM = os.getenv("RAG_STRICT_FALLBACK_TO_LLM", "0").strip(
     "y",
     "on",
 }
+# If false, strict mode does not widen into broad non-focused paragraph assembly.
+RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK = os.getenv(
+    "RAG_STRICT_ALLOW_BROAD_BODY_FALLBACK", "0"
+).strip().lower() in {"1", "true", "yes", "y", "on"}
+# Query-focused extraction includes +/- this many lines around each anchor hit.
+RAG_STRICT_ANCHOR_WINDOW_LINES = int(os.getenv("RAG_STRICT_ANCHOR_WINDOW_LINES", "1"))
 # Max bullet lines in strict sentence fallback.
 RAG_STRICT_EXTRACTIVE_MAX_BULLETS = int(os.getenv("RAG_STRICT_EXTRACTIVE_MAX_BULLETS", "10"))
+# Calibrated abstention gate: minimum score required to answer from retrieved context.
+RAG_MIN_ANSWERABILITY_SCORE = float(os.getenv("RAG_MIN_ANSWERABILITY_SCORE", "0.35"))
 
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+
+# Top-tier retrieval/ranking toggles (all safe defaults).
+RAG_ENABLE_CROSS_ENCODER_RERANK = os.getenv("RAG_ENABLE_CROSS_ENCODER_RERANK", "0").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RAG_CROSS_ENCODER_TOP_N = int(os.getenv("RAG_CROSS_ENCODER_TOP_N", "20"))
+RAG_ENABLE_LEXICAL_INDEX_CACHE = os.getenv("RAG_ENABLE_LEXICAL_INDEX_CACHE", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_ENABLE_SPARSE_LEXICAL_INDEX = os.getenv("RAG_ENABLE_SPARSE_LEXICAL_INDEX", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_LEXICAL_INDEX_TTL_SEC = int(os.getenv("RAG_LEXICAL_INDEX_TTL_SEC", "300"))
+RAG_AB_TEST_ENABLED = os.getenv("RAG_AB_TEST_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_TELEMETRY_ENABLED = os.getenv("RAG_TELEMETRY_ENABLED", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_SENTENCE_EVIDENCE_MIN_OVERLAP = int(os.getenv("RAG_SENTENCE_EVIDENCE_MIN_OVERLAP", "2"))
+RAG_REGRESSION_ALERT_MIN_SAMPLES = int(os.getenv("RAG_REGRESSION_ALERT_MIN_SAMPLES", "50"))
 
 # Fix Django unittest runner incompatibility in this environment.
 TEST_RUNNER = "chatbot.test_runner.NoDurationsDiscoverRunner"

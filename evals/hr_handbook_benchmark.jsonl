@@ -1,0 +1,8 @@
+{"query":"how many hajj leaves are allowed?","expected_terms":["fifteen","15","hajj"],"should_abstain":false}
+{"query":"can i combine hajj leave with annual leave?","expected_terms":["annual","hajj","leave"],"should_abstain":false}
+{"query":"what is the gym reimbursement policy?","expected_terms":["gym","reimbursement"],"should_abstain":false}
+{"query":"are cell phones allowed at work?","expected_terms":["cell","phones","allowed"],"should_abstain":false}
+{"query":"what is the dress code for friday events?","expected_terms":["dress","code"],"should_abstain":true}
+{"query":"how much maternity leave is granted?","expected_terms":["maternity","leave"],"should_abstain":false}
+{"query":"is overtime payment mentioned?","expected_terms":["overtime","payment"],"should_abstain":false}
+{"query":"does the policy mention moonlight allowance for interns?","expected_terms":["moonlight","allowance","interns"],"should_abstain":true}

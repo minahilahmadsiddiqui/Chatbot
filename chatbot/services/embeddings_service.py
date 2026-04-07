@@ -25,7 +25,6 @@ def get_embeddings(texts: List[str], *, batch_size: int = 64) -> List[List[float
 
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     embedding_model = getattr(settings, "OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
-    print(f"embedding_model: {embedding_model}")
     extra_headers = {
         "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
         "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
