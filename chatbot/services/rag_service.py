@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import difflib
-import json
 import re
-import threading
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.conf import settings
@@ -20,56 +17,14 @@ FALLBACK_PHRASE = UNKNOWN_POLICY_PHRASE
 _HANDBOOK_ASSISTANT_GREETING = (
     "Hello! I can help you find information in the employee handbook. What would you like to know?"
 )
-_rag_llm_log_lock = threading.Lock()
-
-
-def _rag_llm_log_file_path() -> Optional[Path]:
-    """
-    JSONL log for what is sent to the LLM:
-    - query vector
-    - retrieved chunk payload texts
-    """
-    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
-        return None
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        return None
-    configured = getattr(settings, "RAG_LLM_INPUT_LOG_PATH", None)
-    if configured:
-        return Path(configured)
-    return Path(base_dir) / "logs" / "rag_llm_input.jsonl"
-
-
 def _append_rag_llm_input_log(
     *,
     query: str,
     query_vector: List[float],
     selected: List[Dict[str, Any]],
 ) -> None:
-    path = _rag_llm_log_file_path()
-    if path is None:
-        return
-    chunk_texts: List[str] = []
-    for r in selected:
-        payload = r.get("payload") or {}
-        text = str(payload.get("text") or "").strip()
-        if text:
-            chunk_texts.append(text)
-    record = {
-        "ts": int(time.time() * 1000),
-        "query": query,
-        "query_vector": query_vector,
-        "chunk_texts": chunk_texts,
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _rag_llm_log_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False))
-                f.write("\n")
-    except Exception:
-        # Logging should never break serving.
-        return
+    del query, query_vector, selected
+    return
 
 
 def _pipeline_fields(*, rag_retrieval_ran: bool, pipeline: str) -> Dict[str, Any]:

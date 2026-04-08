@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 import re
-import threading
 import time
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from django.conf import settings
@@ -14,75 +11,9 @@ from chatbot.services.response_beautify_service import beautify_llm_response
 
 UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
 
-_raw_llm_log_lock = threading.Lock()
-
-
-def _openrouter_raw_log_file_path() -> Optional[Path]:
-    """
-    Log file for OpenRouter chat completion text only (exact API message.content),
-    before strip, summarize, or beautify_llm_response.
-    Override: settings.OPENROUTER_RAW_LOG_PATH (full path to file).
-    """
-    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
-        return None
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        return None
-    configured = getattr(settings, "OPENROUTER_RAW_LOG_PATH", None)
-    if configured:
-        return Path(configured)
-    return Path(base_dir) / "logs" / "openrouter_raw.log"
-
-
-def _openrouter_prompt_log_file_path() -> Optional[Path]:
-    """
-    Log file: exact system + user messages for the *initial* main chat completion only.
-    Override: settings.OPENROUTER_PROMPT_LOG_PATH.
-    """
-    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
-        return None
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        return None
-    configured = getattr(settings, "OPENROUTER_PROMPT_LOG_PATH", None)
-    if configured:
-        return Path(configured)
-    return Path(base_dir) / "logs" / "openrouter_prompt.log"
-
-
 def _append_openrouter_initial_prompt(*, model: str, system_prompt: str, user_prompt: str) -> None:
-    """Append one record: model id + system + user content as sent to OpenRouter (initial call only)."""
-    path = _openrouter_prompt_log_file_path()
-    if path is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = (
-        f"model={model}\n"
-        "----- system -----\n"
-        f"{system_prompt}\n"
-        "----- user -----\n"
-        f"{user_prompt}\n"
-        "----- end request -----\n\n"
-    )
-    with _raw_llm_log_lock:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(record)
-
-
-def _rag_llm_prompt_log_file_path() -> Optional[Path]:
-    """
-    JSONL log for exact LLM input payload (query + chunk texts + prompts).
-    Override: settings.RAG_LLM_PROMPT_LOG_PATH
-    """
-    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
-        return None
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        return None
-    configured = getattr(settings, "RAG_LLM_PROMPT_LOG_PATH", None)
-    if configured:
-        return Path(configured)
-    return Path(base_dir) / "logs" / "rag_llm_prompt_payload.jsonl"
+    del model, system_prompt, user_prompt
+    return
 
 
 def _append_rag_llm_prompt_payload(
@@ -93,103 +24,22 @@ def _append_rag_llm_prompt_payload(
     system_prompt: str,
     user_prompt: str,
 ) -> None:
-    path = _rag_llm_prompt_log_file_path()
-    if path is None:
-        return
-    chunk_texts = [str(c.get("text") or "").strip() for c in context_chunks if str(c.get("text") or "").strip()]
-    payload = {
-        "ts": int(time.time() * 1000),
-        "model": model,
-        "query": question,
-        "chunk_texts": chunk_texts,
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _raw_llm_log_lock:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False))
-            f.write("\n")
+    del model, question, context_chunks, system_prompt, user_prompt
+    return
 
 
 def _append_openrouter_raw_response(text: str) -> None:
-    """Append exact OpenRouter assistant text; no strip (only ensures trailing newline in file)."""
-    path = _openrouter_raw_log_file_path()
-    if path is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _raw_llm_log_lock:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
-
-
-def _raw_answer_log_file_path() -> Optional[Path]:
-    """
-    Path to the raw answer log file (no console).
-    settings.LLM_RAW_LOG_PATH overrides; default BASE_DIR/logs/answer_raw_before_ui.log
-    """
-    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
-        return None
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        return None
-    configured = getattr(settings, "LLM_RAW_LOG_PATH", None)
-    if configured:
-        return Path(configured)
-    return Path(base_dir) / "logs" / "answer_raw_before_ui.log"
-
-
-_OPENROUTER_PROMPT_STUB = (
-    "# OpenRouter prompt log — exact system + user for the main CHAT completion append below.\n"
-    "# With RAG_STRICT_NO_HALLUCINATE (default), answers usually come from extractive retrieval only;\n"
-    "# generate_answer is not called, so this file stays as this notice until an LLM path runs\n"
-    "# (e.g. empty extractive + RAG_STRICT_FALLBACK_TO_LLM=1, or strict mode off).\n\n"
-)
-_OPENROUTER_RAW_STUB = (
-    "# OpenRouter raw assistant replies (before summarize + beautify in gemini_service) append below.\n"
-    "# Same as openrouter_prompt.log: no chat call → no entries here.\n\n"
-)
+    del text
+    return
 
 
 def ensure_raw_answer_log_dir() -> None:
-    """
-    Create log dirs; seed openrouter_*.log with a header if missing (extractive-only runs never
-    call generate_answer, so those files would not exist otherwise).
-    """
-    for getter in (_openrouter_prompt_log_file_path, _openrouter_raw_log_file_path, _raw_answer_log_file_path):
-        path = getter()
-        if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-    pp = _openrouter_prompt_log_file_path()
-    rp = _openrouter_raw_log_file_path()
-    if pp is None and rp is None:
-        return
-    with _raw_llm_log_lock:
-        if pp is not None and not pp.exists():
-            pp.write_text(_OPENROUTER_PROMPT_STUB, encoding="utf-8")
-        if rp is not None and not rp.exists():
-            rp.write_text(_OPENROUTER_RAW_STUB, encoding="utf-8")
+    return
 
 
 def append_raw_answer_before_ui_processing(text: str) -> None:
-    """
-    Append extractive RAG answer text (no OpenRouter call) for audit.
-    OpenRouter chat output is logged separately to openrouter_raw.log inside generate_answer.
-    """
-    path = _raw_answer_log_file_path()
-    if path is None:
-        return
-    raw = (text or "").strip()
-    if not raw:
-        return
-    ensure_raw_answer_log_dir()
-    with _raw_llm_log_lock:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(raw)
-            if not raw.endswith("\n"):
-                f.write("\n")
+    del text
+    return
 
 
 def _openrouter_client() -> OpenAI:
