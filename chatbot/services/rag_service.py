@@ -1,21 +1,75 @@
 from __future__ import annotations
 
 import difflib
+import json
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from django.conf import settings
 
+from chatbot.services.cross_encoder_service import rerank_with_cross_encoder
 from chatbot.services.embeddings_service import get_embeddings
 from chatbot.services.gemini_service import UNKNOWN_POLICY_PHRASE, generate_answer
 from chatbot.services.qdrant_service import QdrantService
 from chatbot.services.text_splitter import count_tokens, truncate_text_to_token_budget
 
-FALLBACK_PHRASE = "Contact the HR department"
+FALLBACK_PHRASE = UNKNOWN_POLICY_PHRASE
 _HANDBOOK_ASSISTANT_GREETING = (
     "Hello! I can help you find information in the employee handbook. What would you like to know?"
 )
+_rag_llm_log_lock = threading.Lock()
+
+
+def _rag_llm_log_file_path() -> Optional[Path]:
+    """
+    JSONL log for what is sent to the LLM:
+    - query vector
+    - retrieved chunk payload texts
+    """
+    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
+        return None
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    configured = getattr(settings, "RAG_LLM_INPUT_LOG_PATH", None)
+    if configured:
+        return Path(configured)
+    return Path(base_dir) / "logs" / "rag_llm_input.jsonl"
+
+
+def _append_rag_llm_input_log(
+    *,
+    query: str,
+    query_vector: List[float],
+    selected: List[Dict[str, Any]],
+) -> None:
+    path = _rag_llm_log_file_path()
+    if path is None:
+        return
+    chunk_texts: List[str] = []
+    for r in selected:
+        payload = r.get("payload") or {}
+        text = str(payload.get("text") or "").strip()
+        if text:
+            chunk_texts.append(text)
+    record = {
+        "ts": int(time.time() * 1000),
+        "query": query,
+        "query_vector": query_vector,
+        "chunk_texts": chunk_texts,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _rag_llm_log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write("\n")
+    except Exception:
+        # Logging should never break serving.
+        return
 
 
 def _pipeline_fields(*, rag_retrieval_ran: bool, pipeline: str) -> Dict[str, Any]:
@@ -65,9 +119,15 @@ def _is_greeting(query: str) -> bool:
 
 def _greeting_answer(query: str) -> str:
     q = re.sub(r"\s+", " ", (query or "").lower()).strip()
-    if q == "how are you":
+    qn = re.sub(r"[^a-z0-9\s]", "", q)
+    qn = re.sub(r"\s+", " ", qn).strip()
+    # Treat exact/clean variants as correct phrasing.
+    if qn == "how are you":
         return "I am doing well, thank you. How can I help you?"
-    if re.search(r"\bhow\s*(are|re|r)\s*(you|u)\b", q):
+    # Typo-ish variants still match via fuzzy/regex greeting detection.
+    if re.search(r"\bhow\s*(are|re|r)\s*(you|u)\b", qn):
+        return "I'm good, looks like you meant \"How are you?\" How can I help you?"
+    if difflib.SequenceMatcher(None, qn, "how are you").ratio() >= 0.74:
         return "I'm good, looks like you meant \"How are you?\" How can I help you?"
     if re.search(r"\b(i['?]?m|i am)\s+(fine|good|well|okay|ok)\b", q):
         return "Glad to hear it. What can I help you find in the employee handbook?"
@@ -212,6 +272,71 @@ def _extractive_answer_with_sources_from_context(
     return answer, used
 
 
+def _cross_encoder_relevance_diagnostics(
+    *,
+    query: str,
+    selected: List[Dict[str, Any]],
+    threshold: float,
+) -> Dict[str, Any]:
+    """
+    Industry-style abstention: learned relevance model (cross-encoder) with
+    confidence threshold + ambiguity margin.
+    """
+    top_dense = float(selected[0].get("score") or 0.0) if selected else 0.0
+    out: Dict[str, Any] = {
+        "top_dense_score": top_dense,
+        "dense_threshold": float(threshold),
+        "dense_pass": bool(selected) and top_dense >= float(threshold),
+    }
+    if not selected:
+        out.update(
+            {
+                "ce_available": False,
+                "ce_applied": False,
+                "ce_top_score": None,
+                "ce_second_score": None,
+                "ce_margin": None,
+                "ce_pass": False,
+            }
+        )
+        return out
+
+    ce_top = selected[0].get("_ce_score")
+    if ce_top is None:
+        out.update(
+            {
+                "ce_available": False,
+                "ce_applied": False,
+                "ce_top_score": None,
+                "ce_second_score": None,
+                "ce_margin": None,
+                "ce_pass": None,
+            }
+        )
+        return out
+
+    top = float(ce_top)
+    second = float(selected[1].get("_ce_score") or 0.0) if len(selected) > 1 else 0.0
+    margin = top - second
+    min_ce = float(getattr(settings, "RAG_CE_MIN_RELEVANCE", 0.45))
+    min_margin = float(getattr(settings, "RAG_CE_MIN_MARGIN", 0.03))
+    ce_pass = top >= min_ce and margin >= min_margin
+
+    out.update(
+        {
+            "ce_available": True,
+            "ce_applied": True,
+            "ce_top_score": top,
+            "ce_second_score": second,
+            "ce_margin": margin,
+            "ce_min_relevance": min_ce,
+            "ce_min_margin": min_margin,
+            "ce_pass": ce_pass,
+        }
+    )
+    return out
+
+
 def run_rag_query(
     *,
     query: str,
@@ -225,6 +350,8 @@ def run_rag_query(
     threshold = float(
         threshold if threshold is not None else getattr(settings, "RAG_SIMILARITY_THRESHOLD", 0.15)
     )
+    # Never allow client-provided threshold to be weaker than server default.
+    threshold = max(threshold, float(getattr(settings, "RAG_SIMILARITY_THRESHOLD", 0.15)))
     max_context_tokens = int(
         max_context_tokens
         if max_context_tokens is not None
@@ -278,6 +405,12 @@ def run_rag_query(
         retrieved.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
         strong = [r for r in retrieved if float(r.get("score") or 0.0) >= threshold]
         selected = (strong if strong else retrieved)[:top_k]
+        if bool(getattr(settings, "RAG_ENABLE_CROSS_ENCODER_RERANK", False)):
+            selected = rerank_with_cross_encoder(
+                query=sanitized,
+                items=selected,
+                top_n=int(getattr(settings, "RAG_CROSS_ENCODER_TOP_N", max(1, len(selected)))),
+            )
         context_chunks = _build_context(selected, max_context_tokens=max_context_tokens)
 
         if not context_chunks:
@@ -299,6 +432,49 @@ def run_rag_query(
                 **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag_empty_context"),
             }
 
+        relevance_diag = _cross_encoder_relevance_diagnostics(
+            query=sanitized,
+            selected=selected,
+            threshold=threshold,
+        )
+        ce_enabled = bool(getattr(settings, "RAG_ENABLE_CROSS_ENCODER_RERANK", False))
+        gate_by_dense = not bool(relevance_diag.get("dense_pass"))
+        gate_by_cross_encoder = ce_enabled and relevance_diag.get("ce_pass") is False
+        if gate_by_dense or gate_by_cross_encoder:
+            latency_ms = int((time.time() - t0) * 1000)
+            return {
+                "answer": UNKNOWN_POLICY_PHRASE,
+                "fallback_used": True,
+                "retrieved": [
+                    {
+                        "score": r.get("score"),
+                        "doc_id": (r.get("payload") or {}).get("doc_id"),
+                        "chunk_index": (r.get("payload") or {}).get("chunk_index"),
+                        "chunk_id": (r.get("payload") or {}).get("chunk_id"),
+                        "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
+                        "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
+                        "page_number": (r.get("payload") or {}).get("page_number"),
+                    }
+                    for r in selected
+                ],
+                "citations": [_citation_entry(c) for c in context_chunks],
+                "latency_ms": latency_ms,
+                "top_k": top_k,
+                "threshold": threshold,
+                "retrieval_diagnostics": {
+                    "retrieved_candidates": len(retrieved),
+                    "above_threshold": len(strong),
+                    "selected_for_context": len(selected),
+                    "abstained_by_relevance_gate": True,
+                    "gate_by_dense": gate_by_dense,
+                    "gate_by_cross_encoder": gate_by_cross_encoder,
+                    **relevance_diag,
+                },
+                "sentence_evidence": [],
+                "ab_variant": "control",
+                **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag_abstain_relevance"),
+            }
+
         extractive_answer, _extractive_used = _extractive_answer_with_sources_from_context(
             sanitized,
             context_chunks,
@@ -308,13 +484,18 @@ def run_rag_query(
 
         llm_error: Optional[str] = None
         try:
+            _append_rag_llm_input_log(
+                query=sanitized,
+                query_vector=query_embedding,
+                selected=selected,
+            )
             answer = generate_answer(
                 question=sanitized,
                 context_chunks=context_chunks,
                 fallback_phrase=FALLBACK_PHRASE,
                 model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
                 max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
-                temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
+                temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.3)),
                 prefer_answer_from_context=True,
             ).strip()
         except Exception as e:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 import threading
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -65,6 +67,49 @@ def _append_openrouter_initial_prompt(*, model: str, system_prompt: str, user_pr
     with _raw_llm_log_lock:
         with open(path, "a", encoding="utf-8") as f:
             f.write(record)
+
+
+def _rag_llm_prompt_log_file_path() -> Optional[Path]:
+    """
+    JSONL log for exact LLM input payload (query + chunk texts + prompts).
+    Override: settings.RAG_LLM_PROMPT_LOG_PATH
+    """
+    if not bool(getattr(settings, "LOG_RAW_LLM_RESPONSE", True)):
+        return None
+    base_dir = getattr(settings, "BASE_DIR", None)
+    if base_dir is None:
+        return None
+    configured = getattr(settings, "RAG_LLM_PROMPT_LOG_PATH", None)
+    if configured:
+        return Path(configured)
+    return Path(base_dir) / "logs" / "rag_llm_prompt_payload.jsonl"
+
+
+def _append_rag_llm_prompt_payload(
+    *,
+    model: str,
+    question: str,
+    context_chunks: List[Dict[str, Any]],
+    system_prompt: str,
+    user_prompt: str,
+) -> None:
+    path = _rag_llm_prompt_log_file_path()
+    if path is None:
+        return
+    chunk_texts = [str(c.get("text") or "").strip() for c in context_chunks if str(c.get("text") or "").strip()]
+    payload = {
+        "ts": int(time.time() * 1000),
+        "model": model,
+        "query": question,
+        "chunk_texts": chunk_texts,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _raw_llm_log_lock:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.write("\n")
 
 
 def _append_openrouter_raw_response(text: str) -> None:
@@ -317,16 +362,18 @@ def generate_answer(
         system_prompt = (
             "You are an employee handbook assistant.\n"
             + concise
-            + "The user question should be answered using ONLY the provided Context excerpts.\n"
-            "Use ONLY excerpts that match the same topic as the user question.\n"
-            "Ignore excerpts that are from other policies, even if they look well-formed.\n"
-            "Do NOT merge multiple unrelated policies into one answer.\n"
-            "If the excerpts contain ANY information that reasonably addresses the question "
-            "(even partial, or spread across chunks), summarize that information clearly.\n"
-            "Do not invent facts that are not supported by the Context.\n"
-            f"Use the exact phrase \"{UNKNOWN_POLICY_PHRASE}\" ONLY when the excerpts do not "
-            "contain relevant information for the question at all.\n"
-            "Prefer quoting or paraphrasing closely from the excerpts.\n"
+            + "The user question must be answered using ONLY the provided Context excerpts.\n"
+            "Follow this decision rule strictly:\n"
+            "Step 1) Determine whether the Context contains direct evidence for the exact question.\n"
+            "Direct evidence means the same policy topic and explicit matching facts (eligibility, limits, amounts, timelines, approvals, conditions, exceptions).\n"
+            "Do NOT treat generic HR text, nearby sections, or loosely related topics as evidence.\n"
+            "If evidence is missing, partial-but-not-on-topic, or ambiguous, respond with EXACTLY this sentence and nothing else:\n"
+            f"\"{UNKNOWN_POLICY_PHRASE}\"\n"
+            "Step 2) Only if direct evidence exists, answer using only those relevant lines/chunks.\n"
+            "Never infer, guess, generalize, or combine unrelated chunks to fabricate an answer.\n"
+            "Never use prior knowledge beyond the Context.\n"
+            "If any requested detail is not explicitly present in Context, omit that detail.\n"
+            "Prefer short, faithful paraphrase close to the original wording.\n"
             "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
         )
     else:
@@ -365,6 +412,13 @@ def generate_answer(
         "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
         "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
     }
+    _append_rag_llm_prompt_payload(
+        model=model,
+        question=question,
+        context_chunks=focused_chunks,
+        system_prompt=system_prompt,
+        user_prompt=prompt,
+    )
     _append_openrouter_initial_prompt(model=model, system_prompt=system_prompt, user_prompt=prompt)
     response = client.chat.completions.create(
         model=model,

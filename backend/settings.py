@@ -19,7 +19,7 @@ load_dotenv(override=True)
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "30"))
+QDRANT_TIMEOUT_SEC = float(os.getenv("QDRANT_TIMEOUT_SEC", "120"))
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "documents")
 # Vector size must match the active embedding model output dimension.
 QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "4096"))
@@ -30,6 +30,9 @@ QDRANT_VECTOR_NAME = os.getenv("QDRANT_VECTOR_NAME", "").strip() or None
 QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH = os.getenv(
     "QDRANT_AUTO_RECREATE_ON_DIMENSION_MISMATCH", "0"
 ).strip().lower() in {"1", "true", "yes", "y", "on"}
+QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "64"))
+QDRANT_UPSERT_RETRIES = int(os.getenv("QDRANT_UPSERT_RETRIES", "3"))
+QDRANT_UPSERT_RETRY_BACKOFF_SEC = float(os.getenv("QDRANT_UPSERT_RETRY_BACKOFF_SEC", "1.0"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost:8000")
@@ -39,7 +42,7 @@ OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "chatbot-backend")
 OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "qwen/qwen3.6-plus:free")
 OPENROUTER_EMBEDDING_MODEL = os.getenv("OPENROUTER_EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
 OPENROUTER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", "1024"))
-OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.1"))
+OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.3"))
 # Seconds for each OpenRouter HTTP call (prevents indefinite hangs; raise if answers truncate often).
 OPENROUTER_HTTP_TIMEOUT_SEC = float(os.getenv("OPENROUTER_HTTP_TIMEOUT_SEC", "120"))
 # Embeddings can hit upstream 408s; allow a longer client read timeout than chat.
@@ -140,8 +143,9 @@ RAG_STRICT_ANCHOR_WINDOW_LINES = int(os.getenv("RAG_STRICT_ANCHOR_WINDOW_LINES",
 RAG_STRICT_MIN_SENTENCE_OVERLAP = int(os.getenv("RAG_STRICT_MIN_SENTENCE_OVERLAP", "2"))
 # Max bullet lines in strict sentence fallback.
 RAG_STRICT_EXTRACTIVE_MAX_BULLETS = int(os.getenv("RAG_STRICT_EXTRACTIVE_MAX_BULLETS", "10"))
-# Calibrated abstention gate: minimum score required to answer from retrieved context.
-RAG_MIN_ANSWERABILITY_SCORE = float(os.getenv("RAG_MIN_ANSWERABILITY_SCORE", "0.42"))
+# Learned relevance gating (cross-encoder) for abstention decisions.
+RAG_CE_MIN_RELEVANCE = float(os.getenv("RAG_CE_MIN_RELEVANCE", "0.45"))
+RAG_CE_MIN_MARGIN = float(os.getenv("RAG_CE_MIN_MARGIN", "0.03"))
 
 # Embeddings batching (provider-dependent)
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))

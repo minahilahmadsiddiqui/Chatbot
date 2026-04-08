@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 
 from django.conf import settings
@@ -166,7 +167,30 @@ class QdrantService:
                         payload=p.get("payload") or {},
                     )
                 )
-        self.client.upsert(collection_name=self.collection_name, points=batch)
+        if not batch:
+            return
+
+        upsert_batch_size = int(getattr(settings, "QDRANT_UPSERT_BATCH_SIZE", 64))
+        upsert_retries = int(getattr(settings, "QDRANT_UPSERT_RETRIES", 3))
+        initial_backoff_sec = float(getattr(settings, "QDRANT_UPSERT_RETRY_BACKOFF_SEC", 1.0))
+
+        for i in range(0, len(batch), max(1, upsert_batch_size)):
+            chunk = batch[i : i + max(1, upsert_batch_size)]
+            attempt = 0
+            while True:
+                try:
+                    self.client.upsert(
+                        collection_name=self.collection_name,
+                        points=chunk,
+                        wait=True,
+                    )
+                    break
+                except Exception:
+                    if attempt >= upsert_retries:
+                        raise
+                    sleep_for = initial_backoff_sec * (2 ** attempt)
+                    time.sleep(min(sleep_for, 8.0))
+                    attempt += 1
 
     def search(self, query_vector, *, limit: int = 5):
         # Prefer query_points (current qdrant-client); pass `using` for named-vector collections.
