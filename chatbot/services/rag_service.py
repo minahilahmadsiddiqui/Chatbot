@@ -299,20 +299,37 @@ def run_rag_query(
                 **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag_empty_context"),
             }
 
-        answer = generate_answer(
-            question=sanitized,
-            context_chunks=context_chunks,
-            fallback_phrase=FALLBACK_PHRASE,
-            model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
-            max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
-            temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
-            prefer_answer_from_context=True,
-        ).strip()
+        extractive_answer, _extractive_used = _extractive_answer_with_sources_from_context(
+            sanitized,
+            context_chunks,
+            max_sentences=int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 5)),
+            query_embedding=query_embedding,
+        )
+
+        llm_error: Optional[str] = None
+        try:
+            answer = generate_answer(
+                question=sanitized,
+                context_chunks=context_chunks,
+                fallback_phrase=FALLBACK_PHRASE,
+                model=getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash"),
+                max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
+                temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.2)),
+                prefer_answer_from_context=True,
+            ).strip()
+        except Exception as e:
+            llm_error = str(e)
+            answer = (extractive_answer or "").strip()
         if not answer:
             answer = UNKNOWN_POLICY_PHRASE
 
         latency_ms = int((time.time() - t0) * 1000)
         fallback = answer == UNKNOWN_POLICY_PHRASE
+        pipeline = "dense_rag"
+        if llm_error and answer != UNKNOWN_POLICY_PHRASE:
+            pipeline = "dense_rag_llm_error_extractive_fallback"
+        elif llm_error:
+            pipeline = "dense_rag_llm_error"
         return {
             "answer": answer,
             "fallback_used": fallback,
@@ -336,22 +353,25 @@ def run_rag_query(
                 "retrieved_candidates": len(retrieved),
                 "above_threshold": len(strong),
                 "selected_for_context": len(selected),
+                **({"llm_error": llm_error} if llm_error else {}),
             },
             "sentence_evidence": [],
             "ab_variant": "control",
-            **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag"),
+            **_pipeline_fields(rag_retrieval_ran=True, pipeline=pipeline),
         }
-    except Exception:
+    except Exception as e:
         latency_ms = int((time.time() - t0) * 1000)
         return {
-            "answer": FALLBACK_PHRASE,
+            "answer": UNKNOWN_POLICY_PHRASE,
             "fallback_used": True,
             "retrieved": [],
             "citations": [],
             "latency_ms": latency_ms,
             "top_k": top_k,
             "threshold": threshold,
-            "retrieval_diagnostics": {},
+            "retrieval_diagnostics": {
+                "error": str(e),
+            },
             "sentence_evidence": [],
             "ab_variant": "control",
             **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag_exception"),
