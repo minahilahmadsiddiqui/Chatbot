@@ -171,6 +171,30 @@ RAG_TELEMETRY_ENABLED = os.getenv("RAG_TELEMETRY_ENABLED", "1").strip().lower() 
 }
 RAG_SENTENCE_EVIDENCE_MIN_OVERLAP = int(os.getenv("RAG_SENTENCE_EVIDENCE_MIN_OVERLAP", "2"))
 RAG_REGRESSION_ALERT_MIN_SAMPLES = int(os.getenv("RAG_REGRESSION_ALERT_MIN_SAMPLES", "50"))
+# Typo handling (strong mode): alias + LLM rewrite + handbook-vocab fuzzy normalization.
+RAG_TYPO_CORRECTION_ENABLED = os.getenv("RAG_TYPO_CORRECTION_ENABLED", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_TYPO_CORRECTION_MODEL = os.getenv("RAG_TYPO_CORRECTION_MODEL", "").strip() or None
+RAG_TYPO_CORRECTION_MAX_TOKENS = int(os.getenv("RAG_TYPO_CORRECTION_MAX_TOKENS", "96"))
+RAG_TYPO_MIN_SIMILARITY_RATIO = float(os.getenv("RAG_TYPO_MIN_SIMILARITY_RATIO", "0.7"))
+RAG_TYPO_ALIASES = os.getenv("RAG_TYPO_ALIASES", "")
+RAG_TYPO_VOCAB_FUZZY_ENABLED = os.getenv("RAG_TYPO_VOCAB_FUZZY_ENABLED", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_TYPO_VOCAB_CUTOFF = float(os.getenv("RAG_TYPO_VOCAB_CUTOFF", "0.74"))
+RAG_TYPO_VOCAB_MIN_LEN = int(os.getenv("RAG_TYPO_VOCAB_MIN_LEN", "3"))
+RAG_TYPO_VOCAB_MAX_CHANGES = int(os.getenv("RAG_TYPO_VOCAB_MAX_CHANGES", "6"))
+RAG_TYPO_RETRY_ORIGINAL_ON_FALLBACK = os.getenv("RAG_TYPO_RETRY_ORIGINAL_ON_FALLBACK", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+# Hallucination safety for typo rewrite:
+# only keep corrected query when dense retrieval score improves enough.
+RAG_TYPO_REQUIRE_SCORE_IMPROVEMENT = os.getenv("RAG_TYPO_REQUIRE_SCORE_IMPROVEMENT", "1").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+RAG_TYPO_MIN_DENSE_DELTA = float(os.getenv("RAG_TYPO_MIN_DENSE_DELTA", "0.01"))
+RAG_TYPO_PROBE_TOP_K = int(os.getenv("RAG_TYPO_PROBE_TOP_K", "6"))
 
 # Fix Django unittest runner incompatibility in this environment.
 TEST_RUNNER = "chatbot.test_runner.NoDurationsDiscoverRunner"

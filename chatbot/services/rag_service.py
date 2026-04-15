@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import time
 from typing import Any, Dict, List, Optional
 
 from django.conf import settings
+from openai import OpenAI
 
 from chatbot.services.cross_encoder_service import rerank_with_cross_encoder
 from chatbot.services.embeddings_service import get_embeddings
 from chatbot.services.gemini_service import UNKNOWN_POLICY_PHRASE, generate_answer
+from chatbot.services.lexical_index_service import get_lexical_rows
 from chatbot.services.qdrant_service import QdrantService
 from chatbot.services.text_splitter import count_tokens, truncate_text_to_token_budget
 
@@ -292,6 +295,205 @@ def _cross_encoder_relevance_diagnostics(
     return out
 
 
+def _openrouter_client_for_query_rewrite() -> OpenAI:
+    api_key = getattr(settings, "OPENROUTER_API_KEY", None)
+    if not api_key:
+        raise RuntimeError("Missing OPENROUTER_API_KEY")
+    base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
+def _default_typo_aliases() -> Dict[str, List[str]]:
+    return {
+        "hajj": ["haj", "hij", "hijj", "hajh", "haaj", "hajjj"],
+    }
+
+
+def _custom_typo_aliases() -> Dict[str, List[str]]:
+    raw = str(getattr(settings, "RAG_TYPO_ALIASES", "") or "").strip()
+    if not raw:
+        return {}
+    out: Dict[str, List[str]] = {}
+    for part in raw.split(","):
+        pair = part.strip()
+        if not pair or ":" not in pair:
+            continue
+        canonical, variants_raw = pair.split(":", 1)
+        canonical = canonical.strip().lower()
+        variants = [v.strip().lower() for v in variants_raw.split("|") if v.strip()]
+        if canonical and variants:
+            out[canonical] = variants
+    return out
+
+
+def _build_alias_variant_map() -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+    merged: Dict[str, List[str]] = {**_default_typo_aliases(), **_custom_typo_aliases()}
+    for canonical, variants in merged.items():
+        alias_map[canonical] = canonical
+        for v in variants:
+            alias_map[v] = canonical
+    return alias_map
+
+
+def _apply_alias_normalization(query: str) -> tuple[str, Dict[str, Any]]:
+    alias_map = _build_alias_variant_map()
+    if not alias_map:
+        return query, {"applied": False, "changes": []}
+    tokens = re.split(r"(\W+)", query or "")
+    out: List[str] = []
+    changes: List[Dict[str, str]] = []
+    for tk in tokens:
+        if not tk or re.fullmatch(r"\W+", tk):
+            out.append(tk)
+            continue
+        repl = alias_map.get(tk.lower())
+        if not repl:
+            out.append(tk)
+            continue
+        final = repl.upper() if tk.isupper() else (repl.title() if tk.istitle() else repl)
+        if final != tk:
+            changes.append({"from": tk, "to": final})
+        out.append(final)
+    return "".join(out).strip(), {"applied": bool(changes), "changes": changes}
+
+
+def _build_handbook_vocab(*, qdrant: QdrantService) -> set[str]:
+    vocab: set[str] = set()
+    try:
+        rows = get_lexical_rows(qdrant=qdrant)
+    except Exception:
+        return vocab
+    for payload in rows or []:
+        text = str(payload.get("text") or "")
+        sec = str(payload.get("source_section") or "")
+        for tok in re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", f"{sec} {text}"):
+            vocab.add(tok.lower())
+    return vocab
+
+
+def _apply_vocab_fuzzy_normalization(query: str, *, vocab: set[str]) -> tuple[str, Dict[str, Any]]:
+    if not bool(getattr(settings, "RAG_TYPO_VOCAB_FUZZY_ENABLED", True)):
+        return query, {"enabled": False, "applied": False, "changes": []}
+    if not vocab:
+        return query, {"enabled": True, "applied": False, "changes": [], "reason": "empty_vocab"}
+    cutoff = float(getattr(settings, "RAG_TYPO_VOCAB_CUTOFF", 0.74))
+    min_len = int(getattr(settings, "RAG_TYPO_VOCAB_MIN_LEN", 3))
+    max_changes = int(getattr(settings, "RAG_TYPO_VOCAB_MAX_CHANGES", 6))
+    tokens = re.split(r"(\W+)", query or "")
+    out: List[str] = []
+    changes: List[Dict[str, str]] = []
+    vocab_list = list(vocab)
+    for tk in tokens:
+        if not tk or re.fullmatch(r"\W+", tk):
+            out.append(tk)
+            continue
+        low = tk.lower()
+        if not low.isalpha() or len(low) < min_len or low in vocab or len(changes) >= max_changes:
+            out.append(tk)
+            continue
+        cand = difflib.get_close_matches(low, vocab_list, n=1, cutoff=cutoff)
+        if not cand:
+            out.append(tk)
+            continue
+        repl = cand[0]
+        final = repl.upper() if tk.isupper() else (repl.title() if tk.istitle() else repl)
+        if final != tk:
+            changes.append({"from": tk, "to": final})
+        out.append(final)
+    return "".join(out).strip(), {"enabled": True, "applied": bool(changes), "changes": changes}
+
+
+def _rewrite_query_for_typos(query: str, *, qdrant: QdrantService) -> tuple[str, Dict[str, Any]]:
+    q = _sanitize_query(query)
+    if not bool(getattr(settings, "RAG_TYPO_CORRECTION_ENABLED", True)):
+        return q, {"enabled": False, "applied": False}
+    if not q:
+        return q, {"enabled": True, "applied": False}
+    alias_seeded_query, alias_diag = _apply_alias_normalization(q)
+    try:
+        client = _openrouter_client_for_query_rewrite()
+        model = str(getattr(settings, "RAG_TYPO_CORRECTION_MODEL", "") or "").strip() or str(
+            getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict typo corrector for employee-handbook queries.\n"
+                        "Correct typos only; do not change intent, entities, numbers, or abbreviations.\n"
+                        "Return JSON only: {\"corrected_query\":\"...\"}."
+                    ),
+                },
+                {"role": "user", "content": alias_seeded_query},
+            ],
+            temperature=0.0,
+            max_tokens=int(getattr(settings, "RAG_TYPO_CORRECTION_MAX_TOKENS", 96)),
+            extra_headers={
+                "HTTP-Referer": str(getattr(settings, "OPENROUTER_REFERER", "http://localhost:8000")),
+                "X-Title": str(getattr(settings, "OPENROUTER_TITLE", "chatbot-backend")),
+            },
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        corrected = _sanitize_query(str((json.loads(raw) or {}).get("corrected_query") or ""))
+        if not corrected:
+            corrected = alias_seeded_query
+        ratio = difflib.SequenceMatcher(None, alias_seeded_query.lower(), corrected.lower()).ratio()
+        if ratio < float(getattr(settings, "RAG_TYPO_MIN_SIMILARITY_RATIO", 0.7)):
+            corrected = alias_seeded_query
+    except Exception as e:
+        corrected = alias_seeded_query
+        error_msg = str(e)
+    else:
+        error_msg = None
+    vocab = _build_handbook_vocab(qdrant=qdrant)
+    vocab_norm_q, vocab_diag = _apply_vocab_fuzzy_normalization(corrected, vocab=vocab)
+    diag: Dict[str, Any] = {
+        "enabled": True,
+        "applied": vocab_norm_q.strip().lower() != q.strip().lower(),
+        "original_query": q,
+        "alias_seeded_query": alias_seeded_query,
+        "corrected_query": vocab_norm_q,
+        "alias_normalization": alias_diag,
+        "vocab_fuzzy_normalization": vocab_diag,
+    }
+    if error_msg:
+        diag["error"] = error_msg
+    return vocab_norm_q, diag
+
+
+def _dense_top_score(result: Dict[str, Any]) -> float:
+    rd = result.get("retrieval_diagnostics") or {}
+    v = rd.get("top_dense_score")
+    if v is None:
+        rows = result.get("retrieved") or []
+        if rows:
+            v = rows[0].get("score")
+    try:
+        return float(v or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _top_dense_score_for_query(*, qdrant: QdrantService, query_text: str, limit: int) -> float:
+    """
+    Lightweight relevance probe used to avoid risky typo rewrites.
+    """
+    emb = get_embeddings([query_text])[0]
+    raw = qdrant.search(emb, limit=max(1, int(limit))) or []
+    if not raw:
+        return 0.0
+    first = raw[0]
+    score = first.score if hasattr(first, "score") else first.get("score")
+    try:
+        return float(score or 0.0)
+    except Exception:
+        return 0.0
+
+
 def run_rag_query(
     *,
     query: str,
@@ -344,10 +546,33 @@ def run_rag_query(
         }
 
     t0 = time.time()
+    typo_diag: Dict[str, Any] = {}
     try:
-        sanitized = _sanitize_query(query)
-        query_embedding = get_embeddings([sanitized])[0]
         qdrant = QdrantService()
+        original_sanitized = _sanitize_query(query)
+        sanitized, typo_diag = _rewrite_query_for_typos(original_sanitized, qdrant=qdrant)
+        correction_applied = bool((typo_diag or {}).get("applied"))
+        if correction_applied and bool(getattr(settings, "RAG_TYPO_REQUIRE_SCORE_IMPROVEMENT", True)):
+            probe_limit = int(getattr(settings, "RAG_TYPO_PROBE_TOP_K", max(3, top_k)))
+            original_top = _top_dense_score_for_query(
+                qdrant=qdrant, query_text=original_sanitized, limit=probe_limit
+            )
+            corrected_top = _top_dense_score_for_query(
+                qdrant=qdrant, query_text=sanitized, limit=probe_limit
+            )
+            min_delta = float(getattr(settings, "RAG_TYPO_MIN_DENSE_DELTA", 0.01))
+            if corrected_top < (original_top + min_delta):
+                sanitized = original_sanitized
+                typo_diag["applied"] = False
+                typo_diag["reverted_for_safety"] = True
+                typo_diag["original_top_dense"] = original_top
+                typo_diag["corrected_top_dense"] = corrected_top
+                typo_diag["min_required_delta"] = min_delta
+            else:
+                typo_diag["original_top_dense"] = original_top
+                typo_diag["corrected_top_dense"] = corrected_top
+                typo_diag["min_required_delta"] = min_delta
+        query_embedding = get_embeddings([sanitized])[0]
         candidate_limit = max(top_k * 4, top_k)
         raw = qdrant.search(query_embedding, limit=candidate_limit) or []
 
@@ -381,6 +606,7 @@ def run_rag_query(
                 "retrieval_diagnostics": {
                     "retrieved_candidates": len(retrieved),
                     "above_threshold": len(strong),
+                    **({"typo_correction": typo_diag} if typo_diag else {}),
                 },
                 "sentence_evidence": [],
                 "ab_variant": "control",
@@ -424,6 +650,7 @@ def run_rag_query(
                     "gate_by_dense": gate_by_dense,
                     "gate_by_cross_encoder": gate_by_cross_encoder,
                     **relevance_diag,
+                    **({"typo_correction": typo_diag} if typo_diag else {}),
                 },
                 "sentence_evidence": [],
                 "ab_variant": "control",
@@ -466,7 +693,7 @@ def run_rag_query(
             pipeline = "dense_rag_llm_error_extractive_fallback"
         elif llm_error:
             pipeline = "dense_rag_llm_error"
-        return {
+        result = {
             "answer": answer,
             "fallback_used": fallback,
             "retrieved": [
@@ -490,11 +717,47 @@ def run_rag_query(
                 "above_threshold": len(strong),
                 "selected_for_context": len(selected),
                 **({"llm_error": llm_error} if llm_error else {}),
+                **({"typo_correction": typo_diag} if typo_diag else {}),
             },
             "sentence_evidence": [],
             "ab_variant": "control",
             **_pipeline_fields(rag_retrieval_ran=True, pipeline=pipeline),
         }
+        if (
+            bool(getattr(settings, "RAG_TYPO_RETRY_ORIGINAL_ON_FALLBACK", True))
+            and bool(result.get("fallback_used"))
+            and sanitized.strip().lower() != original_sanitized.strip().lower()
+        ):
+            retry_embedding = get_embeddings([original_sanitized])[0]
+            retry_raw = qdrant.search(retry_embedding, limit=candidate_limit) or []
+            retry_retrieved: List[Dict[str, Any]] = []
+            for item in retry_raw:
+                score = item.score if hasattr(item, "score") else item.get("score")
+                payload = item.payload if hasattr(item, "payload") else item.get("payload")
+                retry_retrieved.append({"score": score, "payload": payload})
+            retry_retrieved.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+            retry_strong = [r for r in retry_retrieved if float(r.get("score") or 0.0) >= threshold]
+            retry_selected = (retry_strong if retry_strong else retry_retrieved)[:top_k]
+            retry_ctx = _build_context(retry_selected, max_context_tokens=max_context_tokens)
+            if retry_ctx:
+                retry_top = float(retry_selected[0].get("score") or 0.0) if retry_selected else 0.0
+                current_top = _dense_top_score(result)
+                if retry_top >= current_top:
+                    result["retrieved"] = [
+                        {
+                            "score": r.get("score"),
+                            "doc_id": (r.get("payload") or {}).get("doc_id"),
+                            "chunk_index": (r.get("payload") or {}).get("chunk_index"),
+                            "chunk_id": (r.get("payload") or {}).get("chunk_id"),
+                            "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
+                            "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
+                            "page_number": (r.get("payload") or {}).get("page_number"),
+                        }
+                        for r in retry_selected
+                    ]
+                    result["citations"] = [_citation_entry(c) for c in retry_ctx]
+                    result["retrieval_diagnostics"]["retry_original_query_used"] = True
+        return result
     except Exception as e:
         latency_ms = int((time.time() - t0) * 1000)
         return {
@@ -507,6 +770,7 @@ def run_rag_query(
             "threshold": threshold,
             "retrieval_diagnostics": {
                 "error": str(e),
+                **({"typo_correction": typo_diag} if typo_diag else {}),
             },
             "sentence_evidence": [],
             "ab_variant": "control",
