@@ -177,6 +177,7 @@ def generate_answer(
     max_output_tokens: int = 512,
     temperature: float = 0.2,
     prefer_answer_from_context: bool = False,
+    custom_system_prompt: Optional[str] = None,
 ) -> str:
     """
     Calls OpenRouter Chat Completions API.
@@ -240,6 +241,14 @@ def generate_answer(
             "Quote or cite section titles when possible.\n"
             "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
             "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
+        )
+    custom_prompt = (custom_system_prompt or "").strip()
+    if custom_prompt:
+        system_prompt += (
+            "\nAdditional bot instructions from the workspace admin:\n"
+            f"{custom_prompt}\n"
+            "These custom instructions must be followed only when they do not conflict "
+            "with the grounding and safety rules above."
         )
     prompt = (
         "Context (authoritative):\n"

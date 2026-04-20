@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 from django.conf import settings
 from qdrant_client import QdrantClient
@@ -8,6 +8,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    MatchAny,
     PointStruct,
     VectorParams,
     FilterSelector,
@@ -148,6 +149,16 @@ class QdrantService:
                 field_name="doc_id",
                 field_schema=PayloadSchemaType.INTEGER,
             )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="company_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="bot_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
         except Exception:
             # If the index already exists or the client version handles this differently,
             # we ignore errors here to avoid breaking startup.
@@ -192,7 +203,35 @@ class QdrantService:
                     time.sleep(min(sleep_for, 8.0))
                     attempt += 1
 
-    def search(self, query_vector, *, limit: int = 5):
+    def _build_scope_filter(
+        self,
+        *,
+        company_id: Optional[int] = None,
+        bot_id: Optional[int] = None,
+        doc_ids: Optional[Sequence[int]] = None,
+    ) -> Optional[Filter]:
+        must: list[FieldCondition] = []
+        if company_id is not None:
+            must.append(FieldCondition(key="company_id", match=MatchValue(value=int(company_id))))
+        if bot_id is not None:
+            must.append(FieldCondition(key="bot_id", match=MatchValue(value=int(bot_id))))
+        doc_values = [int(v) for v in (doc_ids or []) if v is not None]
+        if doc_values:
+            must.append(FieldCondition(key="doc_id", match=MatchAny(any=doc_values)))
+        if not must:
+            return None
+        return Filter(must=must)
+
+    def search(
+        self,
+        query_vector,
+        *,
+        limit: int = 5,
+        company_id: Optional[int] = None,
+        bot_id: Optional[int] = None,
+        doc_ids: Optional[Sequence[int]] = None,
+    ):
+        query_filter = self._build_scope_filter(company_id=company_id, bot_id=bot_id, doc_ids=doc_ids)
         # Prefer query_points (current qdrant-client); pass `using` for named-vector collections.
         query_fn = getattr(self.client, "query_points", None)
         if query_fn is not None:
@@ -201,6 +240,7 @@ class QdrantService:
                 query=query_vector,
                 limit=limit,
                 using=self._vector_using,
+                query_filter=query_filter,
             )
             points = getattr(result, "points", None)
             return points if points is not None else result
@@ -209,10 +249,19 @@ class QdrantService:
                 collection_name=self.collection_name,
                 query_vector=query_vector,
                 limit=limit,
+                query_filter=query_filter,
             )
         return []
 
-    def scan_payload_points(self, *, limit: int = 256, max_points: Optional[int] = None):
+    def scan_payload_points(
+        self,
+        *,
+        limit: int = 256,
+        max_points: Optional[int] = None,
+        company_id: Optional[int] = None,
+        bot_id: Optional[int] = None,
+        doc_ids: Optional[Sequence[int]] = None,
+    ):
         """
         Scroll payloads (no vectors) for lexical / BM25 scoring over the collection.
         Paginates until `max_points` or the collection is exhausted.
@@ -228,12 +277,18 @@ class QdrantService:
         while len(out) < cap:
             take = min(batch, cap - len(out))
             try:
+                scroll_filter = self._build_scope_filter(
+                    company_id=company_id,
+                    bot_id=bot_id,
+                    doc_ids=doc_ids,
+                )
                 result = self.client.scroll(
                     collection_name=self.collection_name,
                     with_payload=True,
                     with_vectors=False,
                     limit=take,
                     offset=offset,
+                    scroll_filter=scroll_filter,
                 )
             except Exception:
                 break

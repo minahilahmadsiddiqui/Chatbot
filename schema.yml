@@ -1,0 +1,963 @@
+openapi: 3.0.3
+info:
+  title: Chatbot Admin API
+  version: 1.0.0
+  description: Central admin backend for company/product admins.
+paths:
+  /api/admin/bots/:
+    get:
+      operationId: bots_list
+      summary: List bots for current company
+      tags:
+      - admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Bots listed
+    post:
+      operationId: bots_create
+      description: GET lists company bots. POST creates a bot with system prompt and
+        plan type.
+      summary: List or create bots for current company
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBotRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CreateBotRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CreateBotRequest'
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Bots listed
+        '201':
+          description: Bot created
+        '400':
+          description: Validation error
+        '402':
+          description: Plan limit reached
+  /api/admin/bots/{bot_id}/:
+    get:
+      operationId: bot_detail_get
+      summary: Get bot details
+      parameters:
+      - in: path
+        name: bot_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Bot details
+        '404':
+          description: Bot not found
+    patch:
+      operationId: bot_detail_update
+      description: Fetch bot configuration or update name/system prompt for a specific
+        bot.
+      summary: Get or update bot details
+      parameters:
+      - in: path
+        name: bot_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedUpdateBotRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedUpdateBotRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedUpdateBotRequest'
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Bot details
+        '400':
+          description: Validation error
+        '404':
+          description: Bot not found
+  /api/admin/bots/{bot_id}/widget-script/:
+    post:
+      operationId: bot_generate_widget_script
+      summary: Generate embeddable widget script for bot
+      parameters:
+      - in: path
+        name: bot_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Widget script generated
+  /api/admin/chat/query/:
+    post:
+      operationId: chat_query
+      description: |-
+        POST /api/chat/query
+        Body: {"query": "...", "top_k": 5, "threshold": 0.3, "session_id": "optional"}
+      summary: Chat query (bot-scoped)
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatQueryRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ChatQueryRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ChatQueryRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Chat answer
+        '400':
+          description: Validation error
+        '404':
+          description: Bot not found
+  /api/admin/chat/query/stream/:
+    post:
+      operationId: chat_query_stream
+      description: |-
+        Server-Sent Events (SSE) variant of chat/query.
+        Emits: start -> answer -> done (+ citations payload).
+
+        Body: {"query": "...", "top_k": 5, "threshold": 0.3, "session_id": "optional"}
+      summary: Streaming chat query (SSE, bot-scoped)
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatQueryStreamRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ChatQueryStreamRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ChatQueryStreamRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: SSE stream response
+  /api/admin/companies/:
+    post:
+      operationId: admin_companies_create
+      description: Each admin can own exactly one company. Requires Bearer access
+        token.
+      summary: Create company for current admin
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCompanyRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AddCompanyRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AddCompanyRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddCompanyResponse'
+          description: ''
+        '400':
+          description: Validation error
+        '401':
+          description: Unauthorized
+        '409':
+          description: Admin already has a company or domain exists
+  /api/admin/documents/:
+    get:
+      operationId: documents_list
+      summary: List documents for company or bot
+      parameters:
+      - in: query
+        name: bot_id
+        schema:
+          type: integer
+      tags:
+      - admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Document list
+  /api/admin/documents/ingest/:
+    post:
+      operationId: documents_ingest
+      description: Uploads text/file, chunks it, embeds it, and stores vectors in
+        Qdrant scoped to bot/company.
+      summary: Upload and ingest document for selected bot
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Document already exists
+        '201':
+          description: Document ingested
+        '400':
+          description: Validation or ingest error
+        '401':
+          description: Embedding provider auth failure
+  /api/admin/stats/:
+    get:
+      operationId: stats_get
+      summary: Get document/vector stats
+      parameters:
+      - in: query
+        name: bot_id
+        schema:
+          type: integer
+      tags:
+      - admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Stats response
+  /api/auth/login/:
+    post:
+      operationId: auth_login_create
+      summary: Admin login
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminLoginResponse'
+          description: ''
+        '400':
+          description: Missing credentials
+        '401':
+          description: Invalid email or password
+        '403':
+          description: Email not verified
+  /api/auth/logout/:
+    post:
+      operationId: auth_logout_create
+      summary: Logout (revoke refresh token)
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResponse'
+          description: ''
+  /api/auth/refresh/:
+    post:
+      operationId: auth_refresh_create
+      summary: Refresh access token
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+          description: ''
+        '401':
+          description: Invalid or expired refresh token
+  /api/auth/resend-verification-code/:
+    post:
+      operationId: auth_resend_verification_code_create
+      summary: Resend email verification code
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationCodeRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationCodeRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationCodeRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          description: Verification code sent
+        '400':
+          description: Email is required
+        '404':
+          description: Admin not found
+  /api/auth/signup/:
+    post:
+      operationId: auth_signup_create
+      summary: Admin signup
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminSignupRequest'
+            examples:
+              SignupExample:
+                value:
+                  email: admin@example.com
+                  password: StrongPass123
+                  full_name: Admin User
+                summary: Signup example
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AdminSignupRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AdminSignupRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSignupResponse'
+              examples:
+                SignupExample:
+                  value:
+                    email: admin@example.com
+                    password: StrongPass123
+                    full_name: Admin User
+                  summary: Signup example
+          description: ''
+        '400':
+          description: Validation error
+        '409':
+          description: Admin already registered
+  /api/auth/super-admin-example/:
+    get:
+      operationId: auth_super_admin_example_retrieve
+      summary: Super-admin only example endpoint
+      tags:
+      - auth
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Super admin access OK
+  /api/auth/verify-email/:
+    post:
+      operationId: auth_verify_email_create
+      summary: Verify admin email
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          description: Email verified
+        '400':
+          description: Invalid or expired code
+        '404':
+          description: Admin not found
+  /api/delete/{doc_id}/:
+    delete:
+      operationId: documents_delete
+      summary: Delete a document and its vectors
+      parameters:
+      - in: query
+        name: bot_id
+        schema:
+          type: integer
+        required: true
+      - in: path
+        name: doc_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - delete
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Deleted successfully
+        '400':
+          description: Qdrant deletion failure
+        '404':
+          description: Document not found
+  /api/public/chat/query/:
+    post:
+      operationId: public_widget_chat_query
+      description: |-
+        Public widget endpoint.
+        Body: {"widget_key":"...", "query":"...", "top_k":5, "threshold":0.3, "session_id":"optional"}
+      summary: Public widget chat query
+      tags:
+      - public
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicChatQueryRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PublicChatQueryRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PublicChatQueryRequest'
+        required: true
+      security:
+      - JWTAuth: []
+      - {}
+      responses:
+        '200':
+          description: Chat response
+        '400':
+          description: Validation error
+        '404':
+          description: Invalid widget key
+  /api/super-admin/companies/:
+    get:
+      operationId: super_admin_companies_list
+      description: Returns all companies with lightweight analytics for the super-admin
+        table.
+      summary: List companies for super-admin
+      tags:
+      - super-admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuperAdminCompaniesResponse'
+          description: ''
+  /api/super-admin/companies/{company_id}/:
+    get:
+      operationId: super_admin_company_detail
+      description: Returns one company details, summary counts, and related admins/bots/documents.
+      summary: Get company drill-down for super-admin
+      parameters:
+      - in: path
+        name: company_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - super-admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Company detail with aggregates
+        '404':
+          description: Company not found
+  /api/super-admin/companies/{company_id}/plan/:
+    patch:
+      operationId: super_admin_company_update_plan
+      summary: Update company plan (super-admin)
+      parameters:
+      - in: path
+        name: company_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - super-admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedSuperAdminUpdateCompanyPlanRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedSuperAdminUpdateCompanyPlanRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedSuperAdminUpdateCompanyPlanRequest'
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          description: Company plan updated
+        '400':
+          description: Invalid plan_type
+        '404':
+          description: Company not found
+  /api/super-admin/overview/:
+    get:
+      operationId: super_admin_overview
+      description: Returns high-level platform metrics for the super-admin dashboard.
+      summary: Super-admin dashboard overview
+      tags:
+      - super-admin
+      security:
+      - JWTAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuperAdminOverviewResponse'
+          description: ''
+components:
+  schemas:
+    AddCompanyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        plan_type:
+          $ref: '#/components/schemas/PlanTypeEnum'
+      required:
+      - name
+    AddCompanyResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        company:
+          $ref: '#/components/schemas/Company'
+      required:
+      - company
+      - message
+    AdminLoginAdmin:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+        company_id:
+          type: integer
+          nullable: true
+        role:
+          type: string
+      required:
+      - company_id
+      - email
+      - full_name
+      - id
+      - role
+    AdminLoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+      required:
+      - email
+      - password
+    AdminLoginResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        admin:
+          $ref: '#/components/schemas/AdminLoginAdmin'
+      required:
+      - access_token
+      - admin
+      - message
+      - refresh_token
+    AdminSignupAdmin:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+        company_id:
+          type: integer
+          nullable: true
+        is_verified:
+          type: boolean
+      required:
+      - company_id
+      - email
+      - full_name
+      - id
+      - is_verified
+    AdminSignupRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+        full_name:
+          type: string
+      required:
+      - email
+      - full_name
+      - password
+    AdminSignupResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        admin:
+          $ref: '#/components/schemas/AdminSignupAdmin'
+      required:
+      - admin
+      - message
+    ChatQueryRequest:
+      type: object
+      properties:
+        bot_id:
+          type: integer
+        query:
+          type: string
+        top_k:
+          type: integer
+        threshold:
+          type: number
+          format: double
+        session_id:
+          type: string
+      required:
+      - bot_id
+      - query
+    ChatQueryStreamRequest:
+      type: object
+      properties:
+        bot_id:
+          type: integer
+        query:
+          type: string
+        top_k:
+          type: integer
+        threshold:
+          type: number
+          format: double
+        session_id:
+          type: string
+      required:
+      - bot_id
+      - query
+    Company:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        admin_id:
+          type: integer
+      required:
+      - admin_id
+      - id
+      - name
+    CreateBotRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        system_prompt:
+          type: string
+        plan_type:
+          $ref: '#/components/schemas/PlanTypeEnum'
+    LogoutRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: string
+      required:
+      - refresh_token
+    LogoutResponse:
+      type: object
+      properties:
+        message:
+          type: string
+      required:
+      - message
+    PatchedSuperAdminUpdateCompanyPlanRequest:
+      type: object
+      properties:
+        plan_type:
+          $ref: '#/components/schemas/PlanTypeEnum'
+    PatchedUpdateBotRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        system_prompt:
+          type: string
+    PlanTypeEnum:
+      enum:
+      - free
+      - paid
+      type: string
+      description: |-
+        * `free` - free
+        * `paid` - paid
+    PublicChatQueryRequest:
+      type: object
+      properties:
+        widget_key:
+          type: string
+        query:
+          type: string
+        top_k:
+          type: integer
+        threshold:
+          type: number
+          format: double
+        session_id:
+          type: string
+      required:
+      - query
+      - widget_key
+    RefreshTokenRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: string
+      required:
+      - refresh_token
+    RefreshTokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+      required:
+      - access_token
+    ResendVerificationCodeRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+      required:
+      - email
+    SuperAdminCompaniesResponse:
+      type: object
+      properties:
+        companies:
+          type: array
+          items:
+            $ref: '#/components/schemas/SuperAdminCompanyRow'
+      required:
+      - companies
+    SuperAdminCompanyRow:
+      type: object
+      properties:
+        company_id:
+          type: integer
+        name:
+          type: string
+        plan_type:
+          type: string
+        admin_count:
+          type: integer
+        bot_count:
+          type: integer
+        document_count:
+          type: integer
+        query_count:
+          type: integer
+        created_at:
+          type: string
+      required:
+      - admin_count
+      - bot_count
+      - company_id
+      - created_at
+      - document_count
+      - name
+      - plan_type
+      - query_count
+    SuperAdminOverviewResponse:
+      type: object
+      properties:
+        totals:
+          $ref: '#/components/schemas/SuperAdminTotals'
+      required:
+      - totals
+    SuperAdminTotals:
+      type: object
+      properties:
+        companies:
+          type: integer
+        admins:
+          type: integer
+        bots:
+          type: integer
+        documents:
+          type: integer
+        chat_queries:
+          type: integer
+        fallback_queries:
+          type: integer
+        fallback_rate:
+          type: number
+          format: double
+      required:
+      - admins
+      - bots
+      - chat_queries
+      - companies
+      - documents
+      - fallback_queries
+      - fallback_rate
+    UploadDocumentRequest:
+      type: object
+      properties:
+        bot_id:
+          type: integer
+        name:
+          type: string
+        text:
+          type: string
+        file:
+          type: string
+          format: uri
+        force_reindex:
+          type: boolean
+      required:
+      - bot_id
+    VerifyEmailRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        code:
+          type: string
+      required:
+      - code
+      - email
+  securitySchemes:
+    JWTAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

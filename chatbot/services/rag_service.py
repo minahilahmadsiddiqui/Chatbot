@@ -4,7 +4,7 @@ import difflib
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from django.conf import settings
 from openai import OpenAI
@@ -55,6 +55,12 @@ def _is_obvious_gibberish_query(query: str) -> bool:
         ratio = sum(1 for c in letters if c in vowels) / max(len(letters), 1)
         if ratio < 0.1:
             return True
+    # If any alphabetic token is long and vowel-less, treat as gibberish even
+    # when overall query contains vowels in other tokens.
+    for tk in re.findall(r"[a-zA-Z]+", raw):
+        tkl = tk.lower()
+        if len(tkl) >= 4 and not any(c in vowels for c in tkl):
+            return True
     if re.search(r"(.)\1{4,}", letters):
         return True
     return False
@@ -65,6 +71,8 @@ def _is_greeting(query: str) -> bool:
     qn = re.sub(r"[^a-z0-9\s]", "", q)
     qn = re.sub(r"\s+", " ", qn).strip()
     if re.fullmatch(r"(hi|hello|hey)(\s+(there|team|all|everyone))?", qn):
+        return True
+    if re.search(r"\b(?:how|hoe|hui)\s*(are|re|r)\s*(you|u)\b", qn):
         return True
     if re.search(r"\bhow\s*(are|re|r)\s*(you|u)\b", qn):
         return True
@@ -83,7 +91,7 @@ def _greeting_answer(query: str) -> str:
     if qn == "how are you":
         return "I am doing well, thank you. How can I help you?"
     # Typo-ish variants still match via fuzzy/regex greeting detection.
-    if re.search(r"\bhow\s*(are|re|r)\s*(you|u)\b", qn):
+    if re.search(r"\b(?:how|hoe|hui)\s*(are|re|r)\s*(you|u)\b", qn):
         return "I'm good, looks like you meant \"How are you?\" How can I help you?"
     if difflib.SequenceMatcher(None, qn, "how are you").ratio() >= 0.74:
         return "I'm good, looks like you meant \"How are you?\" How can I help you?"
@@ -197,25 +205,39 @@ def _extractive_answer_with_sources_from_context(
         for w in re.findall(r"[a-zA-Z0-9]+", (question or "").lower())
         if len(w) > 2
     }
+    weak_terms = {
+        "what", "when", "where", "which", "who", "whom", "whose", "how",
+        "many", "much", "more", "most", "some", "any", "about",
+        "allowed", "allow", "policy",
+        "are", "is", "was", "were", "be", "been", "being",
+        "the", "a", "an", "for", "with", "into", "from", "that", "this",
+        "your", "their", "once", "during", "shall",
+    }
+    q_terms = {w for w in q_terms if w not in weak_terms}
     sentences: List[str] = []
     used: List[Dict[str, Any]] = []
     for c in context_chunks:
         text = str(c.get("text") or "")
         if not text:
             continue
+        # Normalize bullet separators so unrelated list items are evaluated independently.
+        normalized_text = re.sub(r"[•·▪◦\ufffd]", "\n", text)
         matched_here = False
-        for seg in re.split(r"(?<=[.!?])\s+|\n+", text):
-            s = seg.strip()
-            if len(s) < 20:
-                continue
-            if q_terms:
-                s_terms = {
-                    w for w in re.findall(r"[a-zA-Z0-9]+", s.lower()) if len(w) > 2
-                }
-                if not q_terms.intersection(s_terms):
+        for line in re.split(r"\n+", normalized_text):
+            for seg in re.split(r"(?<=[.!?])\s+", line):
+                s = seg.strip()
+                if len(s) < 20:
                     continue
-            sentences.append(s)
-            matched_here = True
+                if q_terms:
+                    s_terms = {
+                        w for w in re.findall(r"[a-zA-Z0-9]+", s.lower()) if len(w) > 2
+                    }
+                    if not q_terms.intersection(s_terms):
+                        continue
+                sentences.append(s)
+                matched_here = True
+                if max_sentences > 0 and len(sentences) >= max_sentences:
+                    break
             if max_sentences > 0 and len(sentences) >= max_sentences:
                 break
         if matched_here:
@@ -359,10 +381,21 @@ def _apply_alias_normalization(query: str) -> tuple[str, Dict[str, Any]]:
     return "".join(out).strip(), {"applied": bool(changes), "changes": changes}
 
 
-def _build_handbook_vocab(*, qdrant: QdrantService) -> set[str]:
+def _build_handbook_vocab(
+    *,
+    qdrant: QdrantService,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> set[str]:
     vocab: set[str] = set()
     try:
-        rows = get_lexical_rows(qdrant=qdrant)
+        rows = get_lexical_rows(
+            qdrant=qdrant,
+            company_id=company_id,
+            bot_id=bot_id,
+            doc_ids=doc_ids,
+        )
     except Exception:
         return vocab
     for payload in rows or []:
@@ -405,7 +438,14 @@ def _apply_vocab_fuzzy_normalization(query: str, *, vocab: set[str]) -> tuple[st
     return "".join(out).strip(), {"enabled": True, "applied": bool(changes), "changes": changes}
 
 
-def _rewrite_query_for_typos(query: str, *, qdrant: QdrantService) -> tuple[str, Dict[str, Any]]:
+def _rewrite_query_for_typos(
+    query: str,
+    *,
+    qdrant: QdrantService,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> tuple[str, Dict[str, Any]]:
     q = _sanitize_query(query)
     if not bool(getattr(settings, "RAG_TYPO_CORRECTION_ENABLED", True)):
         return q, {"enabled": False, "applied": False}
@@ -449,7 +489,12 @@ def _rewrite_query_for_typos(query: str, *, qdrant: QdrantService) -> tuple[str,
         error_msg = str(e)
     else:
         error_msg = None
-    vocab = _build_handbook_vocab(qdrant=qdrant)
+    vocab = _build_handbook_vocab(
+        qdrant=qdrant,
+        company_id=company_id,
+        bot_id=bot_id,
+        doc_ids=doc_ids,
+    )
     vocab_norm_q, vocab_diag = _apply_vocab_fuzzy_normalization(corrected, vocab=vocab)
     diag: Dict[str, Any] = {
         "enabled": True,
@@ -478,12 +523,26 @@ def _dense_top_score(result: Dict[str, Any]) -> float:
         return 0.0
 
 
-def _top_dense_score_for_query(*, qdrant: QdrantService, query_text: str, limit: int) -> float:
+def _top_dense_score_for_query(
+    *,
+    qdrant: QdrantService,
+    query_text: str,
+    limit: int,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> float:
     """
     Lightweight relevance probe used to avoid risky typo rewrites.
     """
     emb = get_embeddings([query_text])[0]
-    raw = qdrant.search(emb, limit=max(1, int(limit))) or []
+    raw = qdrant.search(
+        emb,
+        limit=max(1, int(limit)),
+        company_id=company_id,
+        bot_id=bot_id,
+        doc_ids=doc_ids,
+    ) or []
     if not raw:
         return 0.0
     first = raw[0]
@@ -501,6 +560,10 @@ def run_rag_query(
     threshold: Optional[float] = None,
     max_context_tokens: Optional[int] = None,
     session_id: str = "",
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+    bot_system_prompt: str = "",
 ) -> Dict[str, Any]:
     del session_id
     top_k = int(top_k if top_k is not None else getattr(settings, "RAG_TOP_K", 5))
@@ -550,15 +613,31 @@ def run_rag_query(
     try:
         qdrant = QdrantService()
         original_sanitized = _sanitize_query(query)
-        sanitized, typo_diag = _rewrite_query_for_typos(original_sanitized, qdrant=qdrant)
+        sanitized, typo_diag = _rewrite_query_for_typos(
+            original_sanitized,
+            qdrant=qdrant,
+            company_id=company_id,
+            bot_id=bot_id,
+            doc_ids=doc_ids,
+        )
         correction_applied = bool((typo_diag or {}).get("applied"))
-        if correction_applied and bool(getattr(settings, "RAG_TYPO_REQUIRE_SCORE_IMPROVEMENT", True)):
+        if correction_applied and bool(getattr(settings, "RAG_TYPO_REQUIRE_SCORE_IMPROVEMENT", False)):
             probe_limit = int(getattr(settings, "RAG_TYPO_PROBE_TOP_K", max(3, top_k)))
             original_top = _top_dense_score_for_query(
-                qdrant=qdrant, query_text=original_sanitized, limit=probe_limit
+                qdrant=qdrant,
+                query_text=original_sanitized,
+                limit=probe_limit,
+                company_id=company_id,
+                bot_id=bot_id,
+                doc_ids=doc_ids,
             )
             corrected_top = _top_dense_score_for_query(
-                qdrant=qdrant, query_text=sanitized, limit=probe_limit
+                qdrant=qdrant,
+                query_text=sanitized,
+                limit=probe_limit,
+                company_id=company_id,
+                bot_id=bot_id,
+                doc_ids=doc_ids,
             )
             min_delta = float(getattr(settings, "RAG_TYPO_MIN_DENSE_DELTA", 0.01))
             if corrected_top < (original_top + min_delta):
@@ -574,7 +653,13 @@ def run_rag_query(
                 typo_diag["min_required_delta"] = min_delta
         query_embedding = get_embeddings([sanitized])[0]
         candidate_limit = max(top_k * 4, top_k)
-        raw = qdrant.search(query_embedding, limit=candidate_limit) or []
+        raw = qdrant.search(
+            query_embedding,
+            limit=candidate_limit,
+            company_id=company_id,
+            bot_id=bot_id,
+            doc_ids=doc_ids,
+        ) or []
 
         retrieved: List[Dict[str, Any]] = []
         for item in raw:
@@ -679,6 +764,7 @@ def run_rag_query(
                 max_output_tokens=int(getattr(settings, "OPENROUTER_MAX_OUTPUT_TOKENS", 1024)),
                 temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.3)),
                 prefer_answer_from_context=True,
+                custom_system_prompt=bot_system_prompt,
             ).strip()
         except Exception as e:
             llm_error = str(e)
@@ -724,12 +810,18 @@ def run_rag_query(
             **_pipeline_fields(rag_retrieval_ran=True, pipeline=pipeline),
         }
         if (
-            bool(getattr(settings, "RAG_TYPO_RETRY_ORIGINAL_ON_FALLBACK", True))
+            bool(getattr(settings, "RAG_TYPO_RETRY_ORIGINAL_ON_FALLBACK", False))
             and bool(result.get("fallback_used"))
             and sanitized.strip().lower() != original_sanitized.strip().lower()
         ):
             retry_embedding = get_embeddings([original_sanitized])[0]
-            retry_raw = qdrant.search(retry_embedding, limit=candidate_limit) or []
+            retry_raw = qdrant.search(
+                retry_embedding,
+                limit=candidate_limit,
+                company_id=company_id,
+                bot_id=bot_id,
+                doc_ids=doc_ids,
+            ) or []
             retry_retrieved: List[Dict[str, Any]] = []
             for item in retry_raw:
                 score = item.score if hasattr(item, "score") else item.get("score")

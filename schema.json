@@ -1,0 +1,760 @@
+{
+    "openapi": "3.0.3",
+    "info": {
+        "title": "Chatbot Admin API",
+        "version": "1.0.0",
+        "description": "Central admin backend for company/product admins."
+    },
+    "paths": {
+        "/api/auth/login/": {
+            "post": {
+                "operationId": "api_auth_login_create",
+                "summary": "Admin login",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminLoginRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminLoginRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminLoginRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/AdminLoginResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "description": "Missing credentials"
+                    },
+                    "401": {
+                        "description": "Invalid email or password"
+                    },
+                    "403": {
+                        "description": "Email not verified"
+                    }
+                }
+            }
+        },
+        "/api/auth/logout/": {
+            "post": {
+                "operationId": "api_auth_logout_create",
+                "summary": "Logout (revoke refresh token)",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/LogoutRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/LogoutRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/LogoutRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/LogoutResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/auth/refresh/": {
+            "post": {
+                "operationId": "api_auth_refresh_create",
+                "summary": "Refresh access token",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/RefreshTokenRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/RefreshTokenRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/RefreshTokenRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/RefreshTokenResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "401": {
+                        "description": "Invalid or expired refresh token"
+                    }
+                }
+            }
+        },
+        "/api/auth/signup/": {
+            "post": {
+                "operationId": "api_auth_signup_create",
+                "summary": "Admin signup",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminSignupRequest"
+                            },
+                            "examples": {
+                                "SignupExample": {
+                                    "value": {
+                                        "email": "admin@example.com",
+                                        "password": "StrongPass123",
+                                        "full_name": "Admin User"
+                                    },
+                                    "summary": "Signup example"
+                                }
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminSignupRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AdminSignupRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/AdminSignupResponse"
+                                },
+                                "examples": {
+                                    "SignupExample": {
+                                        "value": {
+                                            "email": "admin@example.com",
+                                            "password": "StrongPass123",
+                                            "full_name": "Admin User"
+                                        },
+                                        "summary": "Signup example"
+                                    }
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "description": "Validation error"
+                    },
+                    "409": {
+                        "description": "Admin already registered"
+                    }
+                }
+            }
+        },
+        "/api/auth/super-admin-example/": {
+            "get": {
+                "operationId": "api_auth_super_admin_example_retrieve",
+                "summary": "Super-admin only example endpoint",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Super admin access OK"
+                    }
+                }
+            }
+        },
+        "/api/auth/verify-email/": {
+            "post": {
+                "operationId": "api_auth_verify_email_create",
+                "summary": "Verify admin email",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/VerifyEmailRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/VerifyEmailRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/VerifyEmailRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Email verified"
+                    },
+                    "400": {
+                        "description": "Invalid or expired code"
+                    },
+                    "404": {
+                        "description": "Admin not found"
+                    }
+                }
+            }
+        },
+        "/api/chat/query/": {
+            "post": {
+                "operationId": "api_chat_query_create",
+                "description": "POST /api/chat/query\nBody: {\"query\": \"...\", \"top_k\": 5, \"threshold\": 0.3, \"session_id\": \"optional\"}",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/chat/query/stream/": {
+            "post": {
+                "operationId": "api_chat_query_stream_create",
+                "description": "Server-Sent Events (SSE) variant of chat/query.\nEmits: start -> answer -> done (+ citations payload).\n\nBody: {\"query\": \"...\", \"top_k\": 5, \"threshold\": 0.3, \"session_id\": \"optional\"}",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/companies/": {
+            "post": {
+                "operationId": "api_companies_create",
+                "description": "Each admin can own exactly one company. Requires Bearer access token.",
+                "summary": "Create company for current admin",
+                "tags": [
+                    "api"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AddCompanyRequest"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AddCompanyRequest"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AddCompanyRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "JWTAuth": []
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/AddCompanyResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    },
+                    "400": {
+                        "description": "Validation error"
+                    },
+                    "401": {
+                        "description": "Unauthorized"
+                    },
+                    "409": {
+                        "description": "Admin already has a company or domain exists"
+                    }
+                }
+            }
+        },
+        "/api/delete/{doc_id}/": {
+            "delete": {
+                "operationId": "api_delete_destroy",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "doc_id",
+                        "schema": {
+                            "type": "integer"
+                        },
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/documents/": {
+            "get": {
+                "operationId": "api_documents_retrieve",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/documents/ingest/": {
+            "post": {
+                "operationId": "api_documents_ingest_create",
+                "description": "Backwards-compatible ingestion endpoint.\n\nAccepts either:\n  - JSON: {\"text\": \"...\", \"name\": \"...optional\"}\n  - multipart: file upload under key \"file\" (must be .txt)\n\nOptional handbook layout (preserves newlines in the file). Each chunk in Qdrant\nstores: text, source_section (subsection or heading), page_number, chapter_name.\n\nExplicit blocks:\n\n    SOURCE_SECTION: 3.6 Gym reimbursement\n    PAGE_NUMBER: 18\n    Body text for this section...\n\nChapter-style headings (auto-detected, line must start with Chapter/Ch.):\n\n    Chapter 2: Reimbursement\n    Page 48\n    14.7 Purpose\n    Body text...\n\nAliases: PAGE: 18, SOURCE SECTION:, PAGE NUMBER:.\n\nIf there are no SOURCE_SECTION lines but the file has chapters, page markers,\nor numbered headings (e.g. \"14.7 Purpose\", \"=== Page 44 ===\"), the line-aware\nparser fills source_section, page_number, and chapter_name.\n\nPlain prose with none of the above is chunked as one stream; metadata is\ninferred per chunk when possible.\n\nNo file storage is used; only text is embedded into Qdrant.",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/stats/": {
+            "get": {
+                "operationId": "api_stats_retrieve",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        },
+        "/api/upload/": {
+            "post": {
+                "operationId": "api_upload_create",
+                "description": "Backwards-compatible ingestion endpoint.\n\nAccepts either:\n  - JSON: {\"text\": \"...\", \"name\": \"...optional\"}\n  - multipart: file upload under key \"file\" (must be .txt)\n\nOptional handbook layout (preserves newlines in the file). Each chunk in Qdrant\nstores: text, source_section (subsection or heading), page_number, chapter_name.\n\nExplicit blocks:\n\n    SOURCE_SECTION: 3.6 Gym reimbursement\n    PAGE_NUMBER: 18\n    Body text for this section...\n\nChapter-style headings (auto-detected, line must start with Chapter/Ch.):\n\n    Chapter 2: Reimbursement\n    Page 48\n    14.7 Purpose\n    Body text...\n\nAliases: PAGE: 18, SOURCE SECTION:, PAGE NUMBER:.\n\nIf there are no SOURCE_SECTION lines but the file has chapters, page markers,\nor numbered headings (e.g. \"14.7 Purpose\", \"=== Page 44 ===\"), the line-aware\nparser fills source_section, page_number, and chapter_name.\n\nPlain prose with none of the above is chunked as one stream; metadata is\ninferred per chunk when possible.\n\nNo file storage is used; only text is embedded into Qdrant.",
+                "tags": [
+                    "api"
+                ],
+                "security": [
+                    {
+                        "JWTAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "No response body"
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "AddCompanyRequest": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    },
+                    "domain": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "domain",
+                    "name"
+                ]
+            },
+            "AddCompanyResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string"
+                    },
+                    "company": {
+                        "$ref": "#/components/schemas/Company"
+                    }
+                },
+                "required": [
+                    "company",
+                    "message"
+                ]
+            },
+            "AdminLoginAdmin": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer"
+                    },
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "full_name": {
+                        "type": "string"
+                    },
+                    "company_id": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "role": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "company_id",
+                    "email",
+                    "full_name",
+                    "id",
+                    "role"
+                ]
+            },
+            "AdminLoginRequest": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "password": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "email",
+                    "password"
+                ]
+            },
+            "AdminLoginResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string"
+                    },
+                    "access_token": {
+                        "type": "string"
+                    },
+                    "refresh_token": {
+                        "type": "string"
+                    },
+                    "admin": {
+                        "$ref": "#/components/schemas/AdminLoginAdmin"
+                    }
+                },
+                "required": [
+                    "access_token",
+                    "admin",
+                    "message",
+                    "refresh_token"
+                ]
+            },
+            "AdminSignupAdmin": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer"
+                    },
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "full_name": {
+                        "type": "string"
+                    },
+                    "company_id": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "is_verified": {
+                        "type": "boolean"
+                    }
+                },
+                "required": [
+                    "company_id",
+                    "email",
+                    "full_name",
+                    "id",
+                    "is_verified"
+                ]
+            },
+            "AdminSignupRequest": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "password": {
+                        "type": "string"
+                    },
+                    "full_name": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "email",
+                    "full_name",
+                    "password"
+                ]
+            },
+            "AdminSignupResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string"
+                    },
+                    "admin": {
+                        "$ref": "#/components/schemas/AdminSignupAdmin"
+                    }
+                },
+                "required": [
+                    "admin",
+                    "message"
+                ]
+            },
+            "Company": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer"
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "domain": {
+                        "type": "string"
+                    },
+                    "admin_id": {
+                        "type": "integer"
+                    }
+                },
+                "required": [
+                    "admin_id",
+                    "domain",
+                    "id",
+                    "name"
+                ]
+            },
+            "LogoutRequest": {
+                "type": "object",
+                "properties": {
+                    "refresh_token": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "refresh_token"
+                ]
+            },
+            "LogoutResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "message"
+                ]
+            },
+            "RefreshTokenRequest": {
+                "type": "object",
+                "properties": {
+                    "refresh_token": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "refresh_token"
+                ]
+            },
+            "RefreshTokenResponse": {
+                "type": "object",
+                "properties": {
+                    "access_token": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "access_token"
+                ]
+            },
+            "VerifyEmailRequest": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    },
+                    "code": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "code",
+                    "email"
+                ]
+            }
+        },
+        "securitySchemes": {
+            "JWTAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT"
+            }
+        }
+    }
+}

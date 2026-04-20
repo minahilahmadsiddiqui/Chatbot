@@ -3,18 +3,12 @@ from __future__ import annotations
 import time
 import math
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from django.conf import settings
 
 
-_CACHE: Dict[str, Any] = {
-    "built_at": 0.0,
-    "rows": [],
-    "postings": {},
-    "doc_len": [],
-    "avg_doc_len": 0.0,
-}
+_CACHE_BY_SCOPE: Dict[str, Dict[str, Any]] = {}
 
 
 def _tokenize(text: str) -> List[str]:
@@ -39,21 +33,48 @@ def _build_sparse_index(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[int,
     return postings, doc_len, avg_doc_len
 
 
-def get_lexical_rows(*, qdrant: Any) -> List[Dict[str, Any]]:
+def _scope_cache_key(
+    *,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> str:
+    doc_part = ",".join(str(int(v)) for v in sorted(set(doc_ids or [])))
+    return f"company:{company_id}|bot:{bot_id}|docs:{doc_part}"
+
+
+def get_lexical_rows(
+    *,
+    qdrant: Any,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
     """
     Cached payload snapshot for lexical scoring to avoid full rescans every query.
     """
+    scope_key = _scope_cache_key(company_id=company_id, bot_id=bot_id, doc_ids=doc_ids)
+    cache = _CACHE_BY_SCOPE.setdefault(
+        scope_key,
+        {"built_at": 0.0, "rows": [], "postings": {}, "doc_len": [], "avg_doc_len": 0.0},
+    )
     ttl = max(1, int(getattr(settings, "RAG_LEXICAL_INDEX_TTL_SEC", 300)))
     now = time.time()
-    if _CACHE["rows"] and (now - float(_CACHE["built_at"])) <= ttl:
-        return list(_CACHE["rows"])
+    if cache["rows"] and (now - float(cache["built_at"])) <= ttl:
+        return list(cache["rows"])
     scan_fn = getattr(qdrant, "scan_payload_points", None)
     if not callable(scan_fn):
         return []
     per_page = int(getattr(settings, "RAG_LEXICAL_SCAN_LIMIT", 150))
     max_points = int(getattr(settings, "RAG_LEXICAL_MAX_POINTS", 1200))
     try:
-        scanned = scan_fn(limit=per_page, max_points=max_points)
+        scanned = scan_fn(
+            limit=per_page,
+            max_points=max_points,
+            company_id=company_id,
+            bot_id=bot_id,
+            doc_ids=doc_ids,
+        )
     except Exception:
         return []
     rows: List[Dict[str, Any]] = []
@@ -63,26 +84,36 @@ def get_lexical_rows(*, qdrant: Any) -> List[Dict[str, Any]]:
             continue
         rows.append(payload)
     postings, doc_len, avg_doc_len = _build_sparse_index(rows)
-    _CACHE["rows"] = rows
-    _CACHE["postings"] = postings
-    _CACHE["doc_len"] = doc_len
-    _CACHE["avg_doc_len"] = avg_doc_len
-    _CACHE["built_at"] = now
+    cache["rows"] = rows
+    cache["postings"] = postings
+    cache["doc_len"] = doc_len
+    cache["avg_doc_len"] = avg_doc_len
+    cache["built_at"] = now
     return list(rows)
 
 
-def sparse_lexical_candidates(*, qdrant: Any, query_terms: List[str], top_n: int) -> List[Dict[str, Any]]:
+def sparse_lexical_candidates(
+    *,
+    qdrant: Any,
+    query_terms: List[str],
+    top_n: int,
+    company_id: Optional[int] = None,
+    bot_id: Optional[int] = None,
+    doc_ids: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
     """
     Inverted-index BM25 retrieval over cached payloads.
     """
     if not query_terms:
         return []
-    rows = get_lexical_rows(qdrant=qdrant)
+    rows = get_lexical_rows(qdrant=qdrant, company_id=company_id, bot_id=bot_id, doc_ids=doc_ids)
     if not rows:
         return []
-    postings = _CACHE.get("postings") or {}
-    doc_len: List[int] = _CACHE.get("doc_len") or []
-    avg_len = float(_CACHE.get("avg_doc_len") or 1.0)
+    scope_key = _scope_cache_key(company_id=company_id, bot_id=bot_id, doc_ids=doc_ids)
+    cache = _CACHE_BY_SCOPE.get(scope_key) or {}
+    postings = cache.get("postings") or {}
+    doc_len: List[int] = cache.get("doc_len") or []
+    avg_len = float(cache.get("avg_doc_len") or 1.0)
     n_docs = max(1, len(rows))
     k1 = 1.2
     b = 0.75

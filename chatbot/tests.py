@@ -4,6 +4,8 @@ import re
 from unittest.mock import patch
 
 import tiktoken
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase, override_settings
 
 from chatbot.services.rag_service import (
@@ -517,3 +519,101 @@ class ResponseBeautifyHtmlTests(SimpleTestCase):
         assert "<strong>Page number:</strong>" in html_out
         assert "48" in html_out
         assert "<ul>" in html_out and "<li>" in html_out
+
+
+class SuperAdminBootstrapCommandTests(SimpleTestCase):
+    @patch("chatbot.management.commands.bootstrap_super_admin.FirestoreRepository")
+    def test_bootstrap_creates_super_admin(self, mock_repo_cls) -> None:
+        repo = mock_repo_cls.return_value
+        repo.find_super_admin.return_value = None
+        repo.find_admin_by_email.return_value = None
+
+        call_command(
+            "bootstrap_super_admin",
+            "--email=owner@example.com",
+            "--password=StrongPass123",
+            "--full-name=Platform Owner",
+        )
+
+        repo.create_admin.assert_called_once()
+        payload = repo.create_admin.call_args.args[0]
+        assert payload["role"] == "super_admin"
+        assert payload["is_verified"] is True
+        assert payload["email"] == "owner@example.com"
+
+    @patch("chatbot.management.commands.bootstrap_super_admin.FirestoreRepository")
+    def test_bootstrap_rejects_second_super_admin(self, mock_repo_cls) -> None:
+        repo = mock_repo_cls.return_value
+        repo.find_super_admin.return_value = object()
+
+        with self.assertRaises(CommandError):
+            call_command(
+                "bootstrap_super_admin",
+                "--email=owner@example.com",
+                "--password=StrongPass123",
+                "--full-name=Platform Owner",
+            )
+
+
+class ReplaceSuperAdminCommandTests(SimpleTestCase):
+    @patch("chatbot.management.commands.replace_super_admin.FirestoreRepository")
+    def test_replace_promotes_existing_and_deletes_previous(self, mock_repo_cls) -> None:
+        class Existing:
+            id = 10
+            email = "old@example.com"
+
+        class Target:
+            id = 20
+            email = "acme-one@team1.com"
+
+        repo = mock_repo_cls.return_value
+        repo.find_super_admin.return_value = Existing()
+        repo.find_admin_by_email.return_value = Target()
+
+        call_command(
+            "replace_super_admin",
+            "--email=acme-one@team1.com",
+        )
+
+        repo.update_admin.assert_called_once()
+        payload = repo.update_admin.call_args.args[1]
+        assert payload["role"] == "super_admin"
+        repo.delete_admin.assert_called_once_with(10)
+        repo.create_admin.assert_not_called()
+
+    @patch("chatbot.management.commands.replace_super_admin.FirestoreRepository")
+    def test_replace_creates_when_target_missing(self, mock_repo_cls) -> None:
+        class Existing:
+            id = 10
+            email = "old@example.com"
+
+        class Created:
+            id = 30
+            email = "acme-one@team1.com"
+
+        repo = mock_repo_cls.return_value
+        repo.find_super_admin.return_value = Existing()
+        repo.find_admin_by_email.return_value = None
+        repo.create_admin.return_value = Created()
+
+        call_command(
+            "replace_super_admin",
+            "--email=acme-one@team1.com",
+            "--password=StrongPass123",
+            "--full-name=Acme One Team",
+        )
+
+        repo.create_admin.assert_called_once()
+        repo.delete_admin.assert_called_once_with(10)
+
+    @patch("chatbot.management.commands.replace_super_admin.FirestoreRepository")
+    def test_replace_requires_password_and_name_when_missing_target(self, mock_repo_cls) -> None:
+        repo = mock_repo_cls.return_value
+        repo.find_super_admin.return_value = None
+        repo.find_admin_by_email.return_value = None
+
+        with self.assertRaises(CommandError):
+            call_command(
+                "replace_super_admin",
+                "--email=acme-one@team1.com",
+            )
