@@ -10,7 +10,7 @@ import jwt
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.mail import send_mail
-from django.http import StreamingHttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from openai import APIStatusError, AuthenticationError
 from rest_framework import serializers, status
@@ -35,6 +35,11 @@ from chatbot.services.response_beautify_service import (
 )
 from chatbot.services.gemini_service import ensure_raw_answer_log_dir
 from chatbot.services.document_parser import extract_text_from_upload
+from chatbot.services.payment_gateway_service import (
+    create_provider_payment_intent,
+    fetch_provider_payment_intent_for,
+    parse_provider_webhook,
+)
 from chatbot.services.rag_service import FALLBACK_PHRASE, run_rag_query
 from chatbot.services.telemetry_service import append_rag_telemetry
 from chatbot.services.text_splitter import (
@@ -50,6 +55,8 @@ from chatbot.services.text_splitter import (
 from chatbot.auth.jwt_auth import JWTAuthentication, IsAdmin, IsSuperAdmin, generate_access_token, generate_refresh_token
 
 repo = FirestoreRepository()
+PAID_BOT_AMOUNT_PKR = 1680
+PAID_BOT_AMOUNT_USD = 6.0
 
 
 def _current_admin_and_company_id(request) -> Tuple[Optional[Any], Optional[int], Optional[Response]]:
@@ -126,17 +133,668 @@ def _build_widget_script(*, bot_widget_key: str, request) -> str:
     )
 
 
-def _send_verification_email(email: str, code: str) -> None:
-    subject = "Verify your admin account"
-    message = f"Your verification code is: {code}"
-    from_email = getattr(settings, "DEFAULT_FROM_EMAIL", None) or getattr(
-        settings, "EMAIL_HOST_USER", "no-reply@example.com"
+@extend_schema(exclude=True)
+@api_view(["GET"])
+@csrf_exempt
+def public_widget_config(request):
+    widget_key = str(request.query_params.get("widget_key") or "").strip()
+    if not widget_key:
+        return Response({"error": "widget_key is required."}, status=400)
+    bot = repo.find_bot_by_widget_key(widget_key)
+    if not bot:
+        return Response({"error": "Invalid widget key."}, status=404)
+    docs = repo.list_documents_for_bot(company_id=int(bot.company_id), bot_id=int(bot.id))
+    prompt = str(bot.system_prompt or "").strip()
+    first_line = ""
+    if prompt:
+        for line in prompt.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                first_line = cleaned
+                break
+    if len(first_line) > 220:
+        first_line = first_line[:220].rstrip() + "..."
+
+    # Convert instruction-like system prompt lines into user-facing welcome copy.
+    prompt_preview = first_line
+    lowered = prompt_preview.lower()
+    if lowered.startswith("you are "):
+        prompt_preview = prompt_preview[8:].strip()
+    if lowered.startswith("you are an "):
+        prompt_preview = prompt_preview[11:].strip()
+    if lowered.startswith("you are a "):
+        prompt_preview = prompt_preview[10:].strip()
+    if prompt_preview.lower().startswith("the "):
+        prompt_preview = prompt_preview[4:].strip()
+    if prompt_preview.lower().endswith("for this company."):
+        prompt_preview = prompt_preview[: -len("for this company.")].strip()
+    if prompt_preview.lower().endswith("for this company"):
+        prompt_preview = prompt_preview[: -len("for this company")].strip()
+    if prompt_preview and not prompt_preview.endswith("."):
+        prompt_preview = f"{prompt_preview}."
+
+    welcome_message = (
+        f"Hi! I'm {bot.name}. I can help with {prompt_preview}"
+        if prompt_preview
+        else f"Hi! I'm {bot.name}. Ask me anything related to your company's uploaded knowledge base."
     )
+    return Response(
+        {
+            "bot_id": int(bot.id),
+            "bot_name": bot.name,
+            "document_count": len(docs),
+            "welcome_message": welcome_message,
+            "theme": {
+                "navy_deep": "hsl(226,55%,10%)",
+                "navy": "hsl(226,45%,20%)",
+                "navy_light": "hsl(226,35%,30%)",
+                "mint": "hsl(160,62%,55%)",
+                "mint_light": "hsl(160,55%,92%)",
+            },
+        }
+    )
+
+
+@extend_schema(exclude=True)
+@api_view(["GET"])
+@csrf_exempt
+def public_widget_script(request):
+    base = request.build_absolute_uri("/").rstrip("/")
+    chat_url = f"{base}/api/public/chat/query/"
+    config_url = f"{base}/api/public/widget/config/"
+    js = f"""
+(function () {{
+  if (window.__acmeWidgetLoaded) return;
+  window.__acmeWidgetLoaded = true;
+
+  var cfg = window.AcmeChatbotConfig || {{}};
+  var botKey = cfg.botKey || cfg.widgetKey || cfg.key;
+  if (!botKey) {{
+    console.error("Acme widget: missing botKey in window.AcmeChatbotConfig");
+    return;
+  }}
+
+  var CHAT_URL = "{chat_url}";
+  var CONFIG_URL = "{config_url}";
+  var STORAGE_KEY = "acme_widget_history_" + botKey;
+  var SESSION_KEY = "acme_widget_session_" + botKey;
+  var WELCOME_KEY = "acme_widget_welcome_" + botKey;
+  var dynamicWelcome = localStorage.getItem(WELCOME_KEY) || "Hello! How can I help you today?";
+
+  function getSessionId() {{
+    var sid = localStorage.getItem(SESSION_KEY);
+    if (!sid) {{
+      sid = "ws_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem(SESSION_KEY, sid);
+    }}
+    return sid;
+  }}
+
+  function getHistory() {{
+    try {{
+      var raw = localStorage.getItem(STORAGE_KEY);
+      var rows = raw ? JSON.parse(raw) : [];
+      return Array.isArray(rows) ? rows : [];
+    }} catch (_e) {{
+      return [];
+    }}
+  }}
+
+  function setHistory(rows) {{
+    try {{
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(rows || []));
+    }} catch (_e) {{}}
+  }}
+
+  var panelOpen = false;
+  var theme = {{
+    navyDeep: "hsl(226,55%,10%)",
+    navy: "hsl(226,45%,20%)",
+    navyLight: "hsl(226,35%,30%)",
+    mint: "hsl(160,62%,55%)",
+    mintLight: "hsl(160,55%,92%)",
+    textMain: "hsl(222,47%,11%)",
+    textMuted: "hsl(220,9%,46%)",
+    card: "#ffffff",
+    border: "hsl(220,13%,91%)",
+    bgSoft: "hsl(220,20%,97%)"
+  }};
+  if (cfg.theme && typeof cfg.theme === "object") {{
+    theme = Object.assign(theme, {{
+      navyDeep: cfg.theme.navyDeep || cfg.theme.navy_deep || theme.navyDeep,
+      navy: cfg.theme.navy || theme.navy,
+      navyLight: cfg.theme.navyLight || cfg.theme.navy_light || theme.navyLight,
+      mint: cfg.theme.mint || theme.mint,
+      mintLight: cfg.theme.mintLight || cfg.theme.mint_light || theme.mintLight
+    }});
+  }}
+
+  var root = document.createElement("div");
+  root.style.position = "fixed";
+  root.style.right = "24px";
+  root.style.bottom = "24px";
+  root.style.zIndex = "2147483000";
+  root.style.fontFamily = "Inter, Arial, sans-serif";
+
+  var toggleBtn = document.createElement("button");
+  toggleBtn.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false" style="display:block"><path fill="currentColor" d="M12 3C6.48 3 2 6.94 2 11.8c0 2.57 1.3 4.88 3.37 6.5V22l3.46-1.9c1 .27 2.07.4 3.17.4 5.52 0 10-3.94 10-8.8S17.52 3 12 3Zm-4 9.3a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Zm4 0a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Zm4 0a1.3 1.3 0 1 1 0-2.6 1.3 1.3 0 0 1 0 2.6Z"/></svg>';
+  toggleBtn.style.width = "56px";
+  toggleBtn.style.height = "56px";
+  toggleBtn.style.borderRadius = "50%";
+  toggleBtn.style.border = "none";
+  toggleBtn.style.padding = "0";
+  toggleBtn.style.display = "flex";
+  toggleBtn.style.alignItems = "center";
+  toggleBtn.style.justifyContent = "center";
+  toggleBtn.style.lineHeight = "0";
+  toggleBtn.style.cursor = "pointer";
+  toggleBtn.style.background = "linear-gradient(135deg, " + theme.navyDeep + ", " + theme.navy + ")";
+  toggleBtn.style.color = "#fff";
+  toggleBtn.style.boxShadow = "0 10px 24px hsl(226 45% 20% / 0.35), 0 3px 12px hsl(0 0% 0% / 0.12)";
+
+  var panel = document.createElement("div");
+  panel.style.display = "none";
+  panel.style.width = "360px";
+  panel.style.maxWidth = "calc(100vw - 24px)";
+  panel.style.height = "540px";
+  panel.style.maxHeight = "calc(100vh - 100px)";
+  panel.style.borderRadius = "14px";
+  panel.style.overflow = "hidden";
+  panel.style.background = theme.card;
+  panel.style.boxShadow = "0 16px 40px hsl(226 45% 20% / 0.22), 0 8px 20px hsl(226 45% 20% / 0.1)";
+  panel.style.border = "1px solid " + theme.border;
+  panel.style.marginTop = "10px";
+
+  var header = document.createElement("div");
+  header.style.background = "linear-gradient(90deg, " + theme.navyDeep + ", " + theme.navy + ", hsl(166,54%,20%))";
+  header.style.color = "#fff";
+  header.style.padding = "10px 12px";
+  header.style.display = "flex";
+  header.style.alignItems = "center";
+  header.style.justifyContent = "space-between";
+
+  var title = document.createElement("div");
+  title.textContent = cfg.title || "ACME Assistant";
+  title.style.fontWeight = "600";
+  title.style.fontSize = "14px";
+
+  var clearBtn = document.createElement("button");
+  clearBtn.textContent = "Clear";
+  clearBtn.style.background = "transparent";
+  clearBtn.style.color = "hsl(210,20%,90%)";
+  clearBtn.style.border = "1px solid hsl(226,35%,25%)";
+  clearBtn.style.borderRadius = "8px";
+  clearBtn.style.padding = "4px 8px";
+  clearBtn.style.cursor = "pointer";
+  clearBtn.style.fontSize = "12px";
+
+  var body = document.createElement("div");
+  body.style.height = "420px";
+  body.style.overflowY = "auto";
+  body.style.background = theme.bgSoft;
+  body.style.padding = "10px";
+  body.style.display = "flex";
+  body.style.flexDirection = "column";
+  body.style.gap = "8px";
+  body.style.scrollBehavior = "smooth";
+
+  var composer = document.createElement("div");
+  composer.style.display = "flex";
+  composer.style.gap = "8px";
+  composer.style.padding = "10px";
+  composer.style.borderTop = "1px solid " + theme.border;
+  composer.style.background = "#fff";
+
+  var input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "Ask a question...";
+  input.style.flex = "1";
+  input.style.border = "1px solid " + theme.border;
+  input.style.borderRadius = "10px";
+  input.style.padding = "10px";
+  input.style.fontSize = "14px";
+  input.style.color = theme.textMain;
+  input.style.background = "#fff";
+  input.style.outline = "none";
+
+  var sendBtn = document.createElement("button");
+  sendBtn.textContent = "Send";
+  sendBtn.style.border = "none";
+  sendBtn.style.borderRadius = "10px";
+  sendBtn.style.padding = "10px 14px";
+  sendBtn.style.background = "linear-gradient(135deg, " + theme.mint + ", hsl(160,70%,45%))";
+  sendBtn.style.color = "#fff";
+  sendBtn.style.cursor = "pointer";
+  sendBtn.style.fontWeight = "600";
+
+  var introScreen = document.createElement("div");
+  introScreen.style.display = "flex";
+  introScreen.style.flexDirection = "column";
+  introScreen.style.height = "100%";
+  introScreen.style.background = "linear-gradient(180deg, hsl(220 12% 22%), hsl(220 8% 18%))";
+
+  var introTop = document.createElement("div");
+  introTop.style.flex = "1";
+  introTop.style.display = "flex";
+  introTop.style.flexDirection = "column";
+  introTop.style.justifyContent = "center";
+  introTop.style.padding = "28px 24px 20px";
+  introTop.style.color = "#fff";
+
+  var introTitle = document.createElement("div");
+  introTitle.textContent = "Hi there 👋";
+  introTitle.style.fontSize = "36px";
+  introTitle.style.lineHeight = "1.05";
+  introTitle.style.fontWeight = "700";
+
+  var introSubtitle = document.createElement("div");
+  introSubtitle.textContent = "How can I help you?";
+  introSubtitle.style.fontSize = "36px";
+  introSubtitle.style.lineHeight = "1.05";
+  introSubtitle.style.fontWeight = "700";
+  introSubtitle.style.marginTop = "2px";
+
+  var introCtaWrap = document.createElement("div");
+  introCtaWrap.style.padding = "0 16px 16px";
+
+  var introCta = document.createElement("button");
+  introCta.type = "button";
+  introCta.style.width = "100%";
+  introCta.style.background = "#ffffff";
+  introCta.style.border = "1px solid hsl(220 13% 91%)";
+  introCta.style.borderRadius = "16px";
+  introCta.style.padding = "18px 18px";
+  introCta.style.display = "flex";
+  introCta.style.alignItems = "center";
+  introCta.style.justifyContent = "space-between";
+  introCta.style.cursor = "pointer";
+  introCta.style.boxShadow = "0 10px 24px hsl(226 45% 20% / 0.2)";
+  introCta.style.textAlign = "left";
+
+  var introCtaText = document.createElement("div");
+
+  var introCtaHeading = document.createElement("div");
+  introCtaHeading.textContent = "Send us a message";
+  introCtaHeading.style.fontSize = "18px";
+  introCtaHeading.style.fontWeight = "700";
+  introCtaHeading.style.color = "hsl(222,47%,11%)";
+
+  var introCtaHint = document.createElement("div");
+  introCtaHint.textContent = "I'm here for your assisstance";
+  introCtaHint.style.marginTop = "4px";
+  introCtaHint.style.fontSize = "14px";
+  introCtaHint.style.color = "hsl(220,9%,46%)";
+
+  var introCtaArrow = document.createElement("div");
+  introCtaArrow.innerHTML = "&#10148;";
+  introCtaArrow.style.fontSize = "28px";
+  introCtaArrow.style.lineHeight = "1";
+  introCtaArrow.style.color = "hsl(220,10%,22%)";
+
+  var chatShell = document.createElement("div");
+  chatShell.style.display = "none";
+  chatShell.style.height = "100%";
+  chatShell.style.flexDirection = "column";
+
+  var introEmojis = ["🤖"];
+  function setIntroGreeting() {{
+    var emoji = introEmojis[Math.floor(Math.random() * introEmojis.length)];
+    introTitle.textContent = "Hi there " + emoji;
+    introSubtitle.textContent = "How can I help you?";
+  }}
+
+  var headerLeft = document.createElement("div");
+  headerLeft.style.display = "flex";
+  headerLeft.style.alignItems = "center";
+  headerLeft.style.gap = "8px";
+
+  var backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.setAttribute("aria-label", "Back");
+  backBtn.innerHTML = "&#8592;";
+  backBtn.style.width = "30px";
+  backBtn.style.height = "30px";
+  backBtn.style.borderRadius = "8px";
+  backBtn.style.border = "1px solid hsl(226,35%,25%)";
+  backBtn.style.background = "hsl(226 35% 25% / 0.45)";
+  backBtn.style.color = "#fff";
+  backBtn.style.cursor = "pointer";
+  backBtn.style.fontSize = "16px";
+  backBtn.style.lineHeight = "1";
+
+  function applyThemeStyles() {{
+    toggleBtn.style.background = "linear-gradient(135deg, " + theme.navyDeep + ", " + theme.navy + ")";
+    header.style.background = "linear-gradient(90deg, " + theme.navyDeep + ", " + theme.navy + ", " + theme.navyLight + ")";
+    panel.style.border = "1px solid " + theme.border;
+    panel.style.background = theme.card;
+    body.style.background = theme.bgSoft;
+    input.style.border = "1px solid " + theme.border;
+    input.style.color = theme.textMain;
+    sendBtn.style.background = "linear-gradient(135deg, " + theme.navy + ", " + theme.navyLight + ")";
+  }}
+
+  function applyResponsiveLayout() {{
+    var isMobile = window.innerWidth <= 640;
+    root.style.right = isMobile ? "8px" : "24px";
+    root.style.bottom = isMobile ? "8px" : "24px";
+    panel.style.width = isMobile ? "calc(100vw - 16px)" : "380px";
+    panel.style.height = isMobile ? "min(76vh, 560px)" : "560px";
+    panel.style.maxWidth = isMobile ? "calc(100vw - 16px)" : "calc(100vw - 24px)";
+    panel.style.maxHeight = isMobile ? "calc(100vh - 90px)" : "calc(100vh - 100px)";
+    body.style.height = isMobile ? "calc(100% - 122px)" : "438px";
+    introTitle.style.fontSize = isMobile ? "30px" : "36px";
+    introSubtitle.style.fontSize = isMobile ? "30px" : "36px";
+  }}
+
+  function openIntro() {{
+    setIntroGreeting();
+    introScreen.style.display = "flex";
+    chatShell.style.display = "none";
+  }}
+
+  function openChat() {{
+    introScreen.style.display = "none";
+    chatShell.style.display = "flex";
+    renderHistory();
+    setTimeout(function () {{ input.focus(); }}, 60);
+  }}
+
+  function bubble(text, role) {{
+    var row = document.createElement("div");
+    row.style.display = "flex";
+    row.style.flexDirection = "column";
+    row.style.justifyContent = role === "user" ? "flex-end" : "flex-start";
+    row.style.alignItems = role === "user" ? "flex-end" : "flex-start";
+    var b = document.createElement("div");
+    b.textContent = text;
+    b.style.maxWidth = "80%";
+    b.style.padding = "10px 12px";
+    b.style.borderRadius = "14px";
+    b.style.fontSize = "13px";
+    b.style.lineHeight = "1.45";
+    b.style.boxShadow = "0 1px 3px hsl(226 45% 20% / 0.06)";
+    b.style.whiteSpace = "pre-wrap";
+    if (role === "user") {{
+      b.style.background = "linear-gradient(135deg, " + theme.navy + ", " + theme.navyLight + ")";
+      b.style.color = "#ffffff";
+      b.style.borderTopRightRadius = "8px";
+    }} else {{
+      b.style.background = "hsl(220 14% 94%)";
+      b.style.color = theme.textMain;
+      b.style.border = "1px solid " + theme.border;
+      b.style.borderTopLeftRadius = "8px";
+    }}
+    row.appendChild(b);
+    if (role === "user") {{
+      var copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" style="display:block"><path fill="currentColor" d="M16 1H6a2 2 0 0 0-2 2v12h2V3h10V1Zm3 4H10a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm0 16H10V7h9v14Z"/></svg>';
+      copyBtn.style.marginTop = "4px";
+      copyBtn.style.width = "22px";
+      copyBtn.style.height = "22px";
+      copyBtn.style.padding = "0";
+      copyBtn.style.border = "1px solid " + theme.border;
+      copyBtn.style.borderRadius = "6px";
+      copyBtn.style.background = "transparent";
+      copyBtn.style.color = "hsl(220,9%,46%)";
+      copyBtn.style.display = "inline-flex";
+      copyBtn.style.alignItems = "center";
+      copyBtn.style.justifyContent = "center";
+      copyBtn.style.cursor = "pointer";
+      copyBtn.title = "Copy message";
+      copyBtn.addEventListener("click", function () {{
+        var content = String(text || "");
+        if (!content) return;
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(content).then(function () {{
+            copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" style="display:block"><path fill="currentColor" d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>';
+            copyBtn.style.color = "hsl(142,72%,29%)";
+            setTimeout(function () {{
+              copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false" style="display:block"><path fill="currentColor" d="M16 1H6a2 2 0 0 0-2 2v12h2V3h10V1Zm3 4H10a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm0 16H10V7h9v14Z"/></svg>';
+              copyBtn.style.color = "hsl(220,9%,46%)";
+            }}, 1200);
+          }}).catch(function () {{}});
+        }}
+      }});
+      row.appendChild(copyBtn);
+    }}
+    body.appendChild(row);
+    body.scrollTop = body.scrollHeight;
+  }}
+
+  function renderHistory() {{
+    body.innerHTML = "";
+    var rows = getHistory();
+    if (!rows.length) {{
+      bubble(dynamicWelcome, "assistant");
+      return;
+    }}
+    rows.forEach(function (m) {{ bubble(m.content || "", m.role || "assistant"); }});
+  }}
+
+  function addHistory(role, content) {{
+    var rows = getHistory();
+    rows.push({{ role: role, content: content, ts: Date.now() }});
+    setHistory(rows);
+  }}
+
+  function removeTypingIndicator() {{
+    var existing = document.getElementById("acme-widget-typing");
+    if (existing && existing.parentNode) {{
+      existing.parentNode.removeChild(existing);
+    }}
+  }}
+
+  function showTypingIndicator() {{
+    removeTypingIndicator();
+    var row = document.createElement("div");
+    row.id = "acme-widget-typing";
+    row.style.display = "flex";
+    row.style.justifyContent = "flex-start";
+    row.style.alignItems = "center";
+
+    var bubbleWrap = document.createElement("div");
+    bubbleWrap.style.display = "flex";
+    bubbleWrap.style.alignItems = "center";
+    bubbleWrap.style.gap = "8px";
+    bubbleWrap.style.padding = "10px 12px";
+    bubbleWrap.style.borderRadius = "14px";
+    bubbleWrap.style.borderTopLeftRadius = "8px";
+    bubbleWrap.style.background = "hsl(220 14% 94%)";
+    bubbleWrap.style.border = "1px solid " + theme.border;
+    bubbleWrap.style.boxShadow = "0 1px 3px hsl(226 45% 20% / 0.06)";
+
+    var dots = document.createElement("span");
+    dots.textContent = "...";
+    dots.style.fontSize = "16px";
+    dots.style.lineHeight = "1";
+    dots.style.color = theme.mint;
+    dots.style.letterSpacing = "1px";
+    dots.style.animation = "acmeTypingPulse 1s ease-in-out infinite";
+
+    bubbleWrap.appendChild(dots);
+    row.appendChild(bubbleWrap);
+    body.appendChild(row);
+    body.scrollTop = body.scrollHeight;
+  }}
+
+  function setLoading(flag) {{
+    sendBtn.disabled = !!flag;
+    sendBtn.textContent = flag ? "..." : "Send";
+  }}
+
+  async function loadDynamicConfig() {{
+    try {{
+      var res = await fetch(CONFIG_URL + "?widget_key=" + encodeURIComponent(botKey));
+      if (!res.ok) return;
+      var data = await res.json();
+      if (data && data.bot_name && !cfg.title) {{
+        title.textContent = String(data.bot_name);
+      }}
+      if (data && data.welcome_message) {{
+        dynamicWelcome = String(data.welcome_message);
+        localStorage.setItem(WELCOME_KEY, dynamicWelcome);
+      }}
+      if (data && data.theme && typeof data.theme === "object") {{
+        theme = Object.assign(theme, {{
+          navyDeep: data.theme.navy_deep || data.theme.navyDeep || theme.navyDeep,
+          navy: data.theme.navy || theme.navy,
+          navyLight: data.theme.navy_light || data.theme.navyLight || theme.navyLight,
+          mint: data.theme.mint || theme.mint,
+          mintLight: data.theme.mint_light || data.theme.mintLight || theme.mintLight
+        }});
+        applyThemeStyles();
+      }}
+    }} catch (_e) {{
+      // keep defaults
+    }}
+  }}
+
+  async function ask() {{
+    var q = (input.value || "").trim();
+    if (!q) return;
+    input.value = "";
+    addHistory("user", q);
+    bubble(q, "user");
+    setLoading(true);
+    showTypingIndicator();
+    try {{
+      var res = await fetch(CHAT_URL, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          widget_key: botKey,
+          query: q,
+          session_id: getSessionId()
+        }})
+      }});
+      var data = await res.json();
+      var answer = (data && data.answer) ? String(data.answer) : "I could not generate a response.";
+      removeTypingIndicator();
+      addHistory("assistant", answer);
+      bubble(answer, "assistant");
+    }} catch (_e) {{
+      var msg = "Request failed. Please try again.";
+      removeTypingIndicator();
+      addHistory("assistant", msg);
+      bubble(msg, "assistant");
+    }} finally {{
+      removeTypingIndicator();
+      setLoading(false);
+    }}
+  }}
+
+  clearBtn.addEventListener("click", function () {{
+    setHistory([]);
+    localStorage.removeItem(SESSION_KEY);
+    renderHistory();
+  }});
+  sendBtn.addEventListener("click", ask);
+  input.addEventListener("keydown", function (e) {{
+    if (e.key === "Enter") ask();
+  }});
+  input.addEventListener("focus", function () {{
+    input.style.boxShadow = "0 0 0 2px hsl(160 62% 55% / 0.25)";
+    input.style.borderColor = "hsl(160 62% 55%)";
+  }});
+  input.addEventListener("blur", function () {{
+    input.style.boxShadow = "none";
+    input.style.borderColor = theme.border;
+  }});
+  introCta.addEventListener("click", function () {{
+    openChat();
+  }});
+  backBtn.addEventListener("click", function () {{
+    openIntro();
+  }});
+  toggleBtn.addEventListener("click", function () {{
+    panelOpen = !panelOpen;
+    panel.style.display = panelOpen ? "block" : "none";
+    if (panelOpen) {{
+      openIntro();
+    }}
+  }});
+  window.addEventListener("resize", applyResponsiveLayout);
+
+  introTop.appendChild(introTitle);
+  introTop.appendChild(introSubtitle);
+  introCtaText.appendChild(introCtaHeading);
+  introCtaText.appendChild(introCtaHint);
+  introCta.appendChild(introCtaText);
+  introCta.appendChild(introCtaArrow);
+  introCtaWrap.appendChild(introCta);
+  introScreen.appendChild(introTop);
+  introScreen.appendChild(introCtaWrap);
+
+  headerLeft.appendChild(backBtn);
+  headerLeft.appendChild(title);
+  header.appendChild(headerLeft);
+  header.appendChild(clearBtn);
+  composer.appendChild(input);
+  composer.appendChild(sendBtn);
+  chatShell.appendChild(header);
+  chatShell.appendChild(body);
+  chatShell.appendChild(composer);
+  panel.appendChild(introScreen);
+  panel.appendChild(chatShell);
+  root.appendChild(toggleBtn);
+  root.appendChild(panel);
+  document.body.appendChild(root);
+  if (!document.getElementById("acme-widget-typing-style")) {{
+    var typingStyle = document.createElement("style");
+    typingStyle.id = "acme-widget-typing-style";
+    typingStyle.textContent = "@keyframes acmeTypingPulse {{0%{{opacity:.35}}50%{{opacity:1}}100%{{opacity:.35}}}}";
+    document.head.appendChild(typingStyle);
+  }}
+  applyThemeStyles();
+  applyResponsiveLayout();
+  setIntroGreeting();
+  loadDynamicConfig();
+}})();
+"""
+    return HttpResponse(js, content_type="application/javascript; charset=utf-8")
+
+
+def _send_verification_email(email: str, code: str) -> None:
+    subject = "ACME ONE Admin Email Verification Code"
+    message = (
+        "Welcome to ACME ONE.\n\n"
+        "Use the verification code below to confirm your admin email address:\n\n"
+        f"{code}\n\n"
+        "This code expires in 30 minutes.\n"
+        "If you did not request this, you can ignore this email."
+    )
+    sender_address = getattr(settings, "EMAIL_HOST_USER", "").strip() or "no-reply@example.com"
+    sender_name = getattr(settings, "EMAIL_SENDER_NAME", "").strip() or "CHATBOT ADMIN Panel"
+    from_email = f"{sender_name} <{sender_address}>"
     try:
         send_mail(subject, message, from_email, [email], fail_silently=True)
     except Exception:
         # In local/dev environments without email configured we ignore failures.
         pass
+
+
+def _send_password_reset_email(email: str, code: str) -> None:
+    subject = "ACME ONE Admin Password Reset Code"
+    message = (
+        "We received a request to reset your ACME ONE admin password.\n\n"
+        "Use the reset code below to set a new password:\n\n"
+        f"{code}\n\n"
+        "This code expires in 30 minutes.\n"
+        "If you did not request a password reset, you can ignore this email."
+    )
+    sender_address = getattr(settings, "EMAIL_HOST_USER", "").strip() or "no-reply@example.com"
+    sender_name = getattr(settings, "EMAIL_SENDER_NAME", "").strip() or "CHATBOT ADMIN Panel"
+    from_email = f"{sender_name} <{sender_address}>"
+    try:
+        send_mail(subject, message, from_email, [email], fail_silently=True)
+    except Exception:
+        # In local/dev environments without email configured we ignore failures.
+        pass
+
+
+def _fake_provider_intent_id() -> str:
+    return f"pi_{secrets.token_hex(12)}"
 
 
 @extend_schema(
@@ -383,6 +1041,98 @@ def resend_verification_code(request):
         {"message": "Verification code sent successfully."},
         status=status.HTTP_200_OK,
     )
+
+
+@extend_schema(
+    summary="Request password reset code",
+    request=inline_serializer(
+        name="ForgotPasswordRequest",
+        fields={"email": serializers.EmailField()},
+    ),
+    responses={
+        200: OpenApiResponse(description="If account exists, reset code is sent"),
+        400: OpenApiResponse(description="Email is required"),
+    },
+)
+@api_view(["POST"])
+@csrf_exempt
+def forgot_password(request):
+    email = str(request.data.get("email") or "").strip().lower()
+    if not email:
+        return Response({"error": "email is required."}, status=status.HTTP_400_BAD_REQUEST)
+    admin = repo.find_admin_by_email(email)
+    if admin:
+        reset_code = f"{uuid.uuid4().hex[:6]}".upper()
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        repo.update_admin(
+            admin.id,
+            {
+                "password_reset_code": reset_code,
+                "password_reset_expires_at": expires_at,
+            },
+        )
+        _send_password_reset_email(email, reset_code)
+    return Response(
+        {"message": "If this email is registered, a password reset code has been sent."},
+        status=status.HTTP_200_OK,
+    )
+
+
+@extend_schema(
+    summary="Reset admin password",
+    request=inline_serializer(
+        name="ResetPasswordRequest",
+        fields={
+            "email": serializers.EmailField(),
+            "code": serializers.CharField(),
+            "new_password": serializers.CharField(),
+        },
+    ),
+    responses={
+        200: OpenApiResponse(description="Password reset successful"),
+        400: OpenApiResponse(description="Validation/code error"),
+        404: OpenApiResponse(description="Admin not found"),
+    },
+)
+@api_view(["POST"])
+@csrf_exempt
+def reset_password(request):
+    email = str(request.data.get("email") or "").strip().lower()
+    code = str(request.data.get("code") or "").strip().upper()
+    new_password = str(request.data.get("new_password") or "")
+
+    if not email or not code or not new_password:
+        return Response(
+            {"error": "email, code, and new_password are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if len(new_password) < 8:
+        return Response(
+            {"error": "Password must be at least 8 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    admin = repo.find_admin_by_email(email)
+    if not admin:
+        return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
+    if not admin.password_reset_code or admin.password_reset_code.upper() != code:
+        return Response({"error": "Invalid reset code."}, status=status.HTTP_400_BAD_REQUEST)
+    if admin.password_reset_expires_at:
+        try:
+            expires_dt = datetime.fromisoformat(admin.password_reset_expires_at)
+            if expires_dt <= datetime.now(timezone.utc):
+                return Response({"error": "Reset code expired."}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            pass
+
+    repo.update_admin(
+        admin.id,
+        {
+            "password_hash": make_password(new_password),
+            "password_reset_code": None,
+            "password_reset_expires_at": None,
+        },
+    )
+    return Response({"message": "Password reset successful."}, status=status.HTTP_200_OK)
 
 
 @extend_schema(
@@ -697,6 +1447,54 @@ def super_admin_update_company_plan(request, company_id: int):
 
 
 @extend_schema(
+    methods=["GET"],
+    operation_id="admin_get_company",
+    summary="Get current admin company",
+    description="Returns the company linked to the authenticated admin.",
+    responses={
+        200: OpenApiResponse(
+            response=inline_serializer(
+                name="AdminCompanyResponse",
+                fields={
+                    "company": inline_serializer(
+                        name="AdminCompany",
+                        fields={
+                            "id": serializers.IntegerField(),
+                            "name": serializers.CharField(),
+                            "admin_id": serializers.IntegerField(),
+                        },
+                    )
+                },
+            )
+        ),
+        400: OpenApiResponse(description="Admin has no company"),
+        401: OpenApiResponse(description="Unauthorized"),
+        404: OpenApiResponse(description="Company not found"),
+    },
+)
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAdmin])
+@csrf_exempt
+def get_admin_company(request):
+    admin, company_id, err = _current_admin_and_company_id(request)
+    if err:
+        return err
+    company = repo.get_company(int(company_id))
+    if not company:
+        return Response({"error": "Company not found."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(
+        {
+            "company": {
+                "id": int(company.id),
+                "name": company.name,
+                "admin_id": int(company.admin_id),
+            }
+        }
+    )
+
+
+@extend_schema(
     summary="Create company for current admin",
     description="Each admin can own exactly one company. Requires Bearer access token.",
     request=inline_serializer(
@@ -761,6 +1559,365 @@ def add_company(request):
 
 
 @extend_schema(
+    methods=["POST"],
+    operation_id="admin_payment_create_intent",
+    summary="Create payment intent for paid bot",
+    description="Creates a sandbox payment transaction before paid bot creation.",
+    request=inline_serializer(
+        name="CreatePaymentIntentRequest",
+        fields={
+            "bot_name": serializers.CharField(),
+            "payment_method": serializers.ChoiceField(
+                choices=["card", "jazzcash", "bank", "easypaisa", "payfast", "paypro", "paypal"]
+            ),
+            "card_type": serializers.ChoiceField(choices=["credit", "debit"], required=False),
+        },
+    ),
+    responses={
+        201: OpenApiResponse(description="Payment intent created"),
+        400: OpenApiResponse(description="Validation error"),
+        401: OpenApiResponse(description="Unauthorized"),
+    },
+)
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAdmin])
+def create_payment_intent(request):
+    admin, company_id, err = _current_admin_and_company_id(request)
+    if err:
+        return err
+    bot_name = str(request.data.get("bot_name") or "").strip()
+    payment_method = str(request.data.get("payment_method") or "").strip().lower()
+    card_type = str(request.data.get("card_type") or "").strip().lower()
+    if not bot_name:
+        return Response({"error": "bot_name is required."}, status=400)
+    if payment_method not in {"card", "jazzcash", "bank", "easypaisa", "payfast", "paypro", "paypal"}:
+        return Response(
+            {
+                "error": (
+                    "payment_method must be one of: "
+                    "card, jazzcash, bank, easypaisa, payfast, paypro, paypal."
+                )
+            },
+            status=400,
+        )
+    if payment_method == "card" and card_type not in {"credit", "debit"}:
+        return Response({"error": "card_type must be 'credit' or 'debit' for card payments."}, status=400)
+    provider_mode = str(getattr(settings, "PAYMENT_PROVIDER", "sandbox")).strip().lower() or "sandbox"
+    provider_intent_id = _fake_provider_intent_id()
+    provider_status = "pending"
+    client_secret = None
+    checkout_url = None
+    provider = "sandbox"
+    if provider_mode != "sandbox":
+        try:
+            provider_currency = str(getattr(settings, "PAYMENT_CURRENCY", "pkr")).strip().lower() or "pkr"
+            charge_amount = float(PAID_BOT_AMOUNT_PKR) if provider_currency == "pkr" else float(PAID_BOT_AMOUNT_USD)
+            provider_result = create_provider_payment_intent(
+                payment_method=payment_method,
+                amount_major=charge_amount,
+                currency=provider_currency,
+                metadata={
+                    "company_id": int(company_id),
+                    "admin_id": int(admin.id),
+                    "bot_name": bot_name,
+                },
+            )
+        except Exception as exc:
+            return Response({"error": f"Payment provider error: {str(exc)}"}, status=502)
+        provider_intent_id = provider_result.provider_intent_id
+        provider_status = provider_result.status
+        client_secret = provider_result.client_secret
+        checkout_url = provider_result.checkout_url
+        provider = provider_result.provider
+    payment = repo.create_payment(
+        {
+            "company_id": int(company_id),
+            "admin_id": int(admin.id),
+            "bot_name": bot_name,
+            "amount_pkr": PAID_BOT_AMOUNT_PKR,
+            "amount_usd": PAID_BOT_AMOUNT_USD,
+            "currency": "PKR",
+            "payment_method": payment_method,
+            "card_type": card_type if payment_method == "card" else None,
+            "provider": provider,
+            "provider_intent_id": provider_intent_id,
+            "status": provider_status,
+            "metadata": {"source": "admin_bot_checkout"},
+        }
+    )
+    return Response(
+        {
+            "message": "Payment intent created.",
+            "payment": {
+                "id": payment.id,
+                "provider_intent_id": payment.provider_intent_id,
+                "status": payment.status,
+                "bot_name": payment.bot_name,
+                "amount_pkr": payment.amount_pkr,
+                "amount_usd": payment.amount_usd,
+                "currency": payment.currency,
+                "payment_method": payment.payment_method,
+                "card_type": payment.card_type,
+                "provider": payment.provider,
+                "client_secret": client_secret,
+                "checkout_url": checkout_url,
+                "created_at": payment.created_at,
+            },
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@extend_schema(
+    methods=["POST"],
+    operation_id="admin_payment_confirm",
+    summary="Confirm a payment intent",
+    description="Marks a sandbox transaction as paid. In production this would be done by webhook verification.",
+    request=inline_serializer(
+        name="ConfirmPaymentRequest",
+        fields={
+            "payment_id": serializers.IntegerField(required=False),
+            "provider_intent_id": serializers.CharField(required=False),
+        },
+    ),
+    responses={
+        200: OpenApiResponse(description="Payment confirmed"),
+        400: OpenApiResponse(description="Validation error"),
+        404: OpenApiResponse(description="Payment not found"),
+    },
+)
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAdmin])
+def confirm_payment(request):
+    admin, company_id, err = _current_admin_and_company_id(request)
+    if err:
+        return err
+    payment_id = _parse_int(request.data.get("payment_id"))
+    provider_intent_id = str(request.data.get("provider_intent_id") or "").strip()
+    payment = None
+    if payment_id is not None:
+        payment = repo.get_payment(payment_id)
+    elif provider_intent_id:
+        payment = repo.find_payment_by_provider_intent_id(provider_intent_id)
+    else:
+        return Response({"error": "payment_id or provider_intent_id is required."}, status=400)
+    if not payment:
+        return Response({"error": "Payment not found."}, status=404)
+    if int(payment.company_id) != int(company_id) or int(payment.admin_id) != int(admin.id):
+        return Response({"error": "Payment not found."}, status=404)
+    if str(payment.provider).lower() != "sandbox":
+        try:
+            provider_payment = fetch_provider_payment_intent_for(
+                provider=str(payment.provider).lower(),
+                provider_intent_id=payment.provider_intent_id,
+            )
+        except Exception as exc:
+            return Response({"error": f"Payment provider error: {str(exc)}"}, status=502)
+        provider_status = str(provider_payment.status).lower()
+        updates: Dict[str, Any] = {"status": provider_status}
+        if provider_status in {"succeeded", "paid", "completed", "captured", "success"}:
+            updates["status"] = "paid"
+            updates["paid_at"] = datetime.now(timezone.utc).isoformat()
+        elif provider_status in {"failed", "cancelled", "canceled", "declined", "error"}:
+            updates["status"] = "failed"
+        repo.update_payment(int(payment.id), updates)
+        fresh = repo.get_payment(int(payment.id))
+        return Response(
+            {
+                "message": "Payment status synchronized.",
+                "payment": {
+                    "id": fresh.id,
+                    "provider_intent_id": fresh.provider_intent_id,
+                    "status": fresh.status,
+                    "paid_at": fresh.paid_at,
+                    "amount_pkr": fresh.amount_pkr,
+                    "amount_usd": fresh.amount_usd,
+                },
+            }
+        )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    repo.update_payment(int(payment.id), {"status": "paid", "paid_at": now_iso})
+    fresh = repo.get_payment(int(payment.id))
+    return Response(
+        {
+            "message": "Payment confirmed.",
+            "payment": {
+                "id": fresh.id,
+                "provider_intent_id": fresh.provider_intent_id,
+                "status": fresh.status,
+                "paid_at": fresh.paid_at,
+                "amount_pkr": fresh.amount_pkr,
+                "amount_usd": fresh.amount_usd,
+            },
+        }
+    )
+
+
+@extend_schema(
+    methods=["GET"],
+    operation_id="admin_payment_status",
+    summary="Get payment status",
+    parameters=[
+        OpenApiParameter("payment_id", OpenApiTypes.INT, OpenApiParameter.QUERY, required=False),
+        OpenApiParameter(
+            "provider_intent_id",
+            OpenApiTypes.STR,
+            OpenApiParameter.QUERY,
+            required=False,
+        ),
+    ],
+    responses={
+        200: OpenApiResponse(description="Payment status"),
+        400: OpenApiResponse(description="Validation error"),
+        404: OpenApiResponse(description="Payment not found"),
+    },
+)
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAdmin])
+def payment_status(request):
+    admin, company_id, err = _current_admin_and_company_id(request)
+    if err:
+        return err
+    payment_id = _parse_int(request.query_params.get("payment_id"))
+    provider_intent_id = str(request.query_params.get("provider_intent_id") or "").strip()
+    payment = repo.get_payment(payment_id) if payment_id is not None else None
+    if payment is None and provider_intent_id:
+        payment = repo.find_payment_by_provider_intent_id(provider_intent_id)
+    if not payment:
+        return Response({"error": "Payment not found."}, status=404)
+    if int(payment.company_id) != int(company_id) or int(payment.admin_id) != int(admin.id):
+        return Response({"error": "Payment not found."}, status=404)
+    if str(payment.provider).lower() != "sandbox":
+        try:
+            provider_payment = fetch_provider_payment_intent_for(
+                provider=str(payment.provider).lower(),
+                provider_intent_id=payment.provider_intent_id,
+            )
+            provider_status = str(provider_payment.status).lower()
+            updates: Dict[str, Any] = {"status": provider_status}
+            if provider_status in {"succeeded", "paid", "completed", "captured", "success"}:
+                updates["status"] = "paid"
+                if not payment.paid_at:
+                    updates["paid_at"] = datetime.now(timezone.utc).isoformat()
+            elif provider_status in {"failed", "cancelled", "canceled", "declined", "error"}:
+                updates["status"] = "failed"
+            repo.update_payment(int(payment.id), updates)
+            payment = repo.get_payment(int(payment.id)) or payment
+        except Exception:
+            # Keep local status if provider lookup temporarily fails.
+            pass
+    return Response(
+        {
+            "payment": {
+                "id": payment.id,
+                "provider_intent_id": payment.provider_intent_id,
+                "status": payment.status,
+                "bot_name": payment.bot_name,
+                "amount_pkr": payment.amount_pkr,
+                "amount_usd": payment.amount_usd,
+                "currency": payment.currency,
+                "payment_method": payment.payment_method,
+                "card_type": payment.card_type,
+                "created_at": payment.created_at,
+                "updated_at": payment.updated_at,
+                "paid_at": payment.paid_at,
+            }
+        }
+    )
+
+
+@extend_schema(
+    methods=["POST"],
+    operation_id="payment_webhook",
+    summary="Payment webhook callback",
+    description="Provider callback endpoint to update transaction status.",
+    parameters=[
+        OpenApiParameter(
+            "provider",
+            OpenApiTypes.STR,
+            OpenApiParameter.QUERY,
+            required=False,
+            description="Provider key e.g. stripe, paypal, jazzcash, easypaisa, payfast, paypro, bank_transfer.",
+        )
+    ],
+    request=inline_serializer(
+        name="PaymentWebhookRequest",
+        fields={
+            "provider_intent_id": serializers.CharField(),
+            "event": serializers.ChoiceField(choices=["payment.succeeded", "payment.failed"]),
+        },
+    ),
+    responses={200: OpenApiResponse(description="Webhook processed")},
+)
+@csrf_exempt
+@api_view(["POST"])
+@permission_classes([])
+@authentication_classes([])
+def payment_webhook(request):
+    provider = str(request.query_params.get("provider") or "").strip().lower()
+    if not provider:
+        provider = str(getattr(settings, "PAYMENT_PROVIDER", "sandbox")).strip().lower() or "sandbox"
+    signature = (
+        str(request.headers.get("Stripe-Signature") or "")
+        or str(request.headers.get("X-Signature") or "")
+        or str(request.headers.get("Paypal-Transmission-Sig") or "")
+    )
+    if provider == "stripe" and not signature:
+        return Response({"error": "Missing Stripe-Signature header."}, status=400)
+    try:
+        event = parse_provider_webhook(provider=provider, payload=request.body, signature=signature)
+    except Exception as exc:
+        return Response({"error": f"Webhook verification failed: {str(exc)}"}, status=400)
+    if provider == "stripe":
+        event_type = str(event.get("type") or "").strip().lower()
+        obj = ((event.get("data") or {}).get("object") or {}) if isinstance(event, dict) else {}
+        provider_intent_id = str(obj.get("id") or "").strip()
+    elif provider == "paypal":
+        event_type = str(event.get("event_type") or "").strip().lower()
+        resource = event.get("resource") or {}
+        provider_intent_id = str((resource or {}).get("id") or "").strip()
+    else:
+        event_type = str(event.get("event") or event.get("status") or "").strip().lower()
+        provider_intent_id = str(event.get("provider_intent_id") or event.get("id") or "").strip()
+    if not provider_intent_id:
+        return Response({"message": "ignored"}, status=200)
+    payment = repo.find_payment_by_provider_intent_id(provider_intent_id)
+    if not payment:
+        return Response({"message": "ignored"}, status=200)
+    success_events = {
+        "payment_intent.succeeded",
+        "checkout.order.approved",
+        "payment.succeeded",
+        "paid",
+        "completed",
+        "success",
+    }
+    failed_events = {
+        "payment_intent.payment_failed",
+        "payment_intent.canceled",
+        "payment.failed",
+        "failed",
+        "cancelled",
+        "canceled",
+        "declined",
+    }
+    if event_type in success_events:
+        repo.update_payment(
+            int(payment.id),
+            {"status": "paid", "paid_at": datetime.now(timezone.utc).isoformat()},
+        )
+    elif event_type in failed_events:
+        repo.update_payment(int(payment.id), {"status": "failed"})
+    return Response({"message": "ok"})
+
+
+@extend_schema(
     methods=["GET"],
     operation_id="bots_list",
     summary="List bots for current company",
@@ -770,20 +1927,19 @@ def add_company(request):
     methods=["POST"],
     operation_id="bots_create",
     summary="List or create bots for current company",
-    description="GET lists company bots. POST creates a bot with system prompt and plan type.",
+    description="GET lists company bots. POST creates one bot per company.",
     request=inline_serializer(
         name="CreateBotRequest",
         fields={
             "name": serializers.CharField(required=False),
             "system_prompt": serializers.CharField(required=False, allow_blank=True),
-            "plan_type": serializers.ChoiceField(choices=["free", "paid"], required=False),
+            "openrouter_api_key": serializers.CharField(required=False, allow_blank=True),
         },
     ),
     responses={
         200: OpenApiResponse(description="Bots listed"),
         201: OpenApiResponse(description="Bot created"),
         400: OpenApiResponse(description="Validation error"),
-        402: OpenApiResponse(description="Plan limit reached"),
     },
 )
 @csrf_exempt
@@ -791,9 +1947,33 @@ def add_company(request):
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAdmin])
 def bots(request):
-    _admin, company_id, err = _current_admin_and_company_id(request)
-    if err:
-        return err
+    admin_id = int(getattr(request.user, "id"))
+    admin = repo.get_admin(admin_id)
+    if not admin:
+        return Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    company_id: Optional[int] = None
+    if admin.company_id is not None:
+        company_id = int(admin.company_id)
+    elif str(getattr(request.user, "role", "")).lower() == "super_admin":
+        company_raw = request.query_params.get("company_id")
+        if request.method == "POST":
+            company_raw = request.data.get("company_id") or company_raw
+        parsed_company_id = _parse_int(company_raw)
+        if parsed_company_id is None:
+            return Response(
+                {"error": "company_id is required for super admin context."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company = repo.get_company(parsed_company_id)
+        if not company:
+            return Response({"error": "Company not found."}, status=status.HTTP_404_NOT_FOUND)
+        company_id = int(parsed_company_id)
+    else:
+        return Response(
+            {"error": "Admin is not linked to a company. Create company first."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if request.method == "GET":
         rows = repo.list_bots(company_id=company_id)
@@ -804,6 +1984,7 @@ def bots(request):
                     "company_id": b.company_id,
                     "name": b.name,
                     "system_prompt": b.system_prompt,
+                    "openrouter_api_key": b.openrouter_api_key,
                     "plan_type": b.plan_type,
                     "widget_key": b.widget_key,
                     "created_at": b.created_at,
@@ -814,37 +1995,23 @@ def bots(request):
 
     name = str(request.data.get("name") or "").strip()
     system_prompt = str(request.data.get("system_prompt") or "").strip()
-    requested_plan = str(request.data.get("plan_type") or "free").strip().lower() or "free"
-    if requested_plan not in {"free", "paid"}:
-        return Response({"error": "plan_type must be either 'free' or 'paid'."}, status=400)
+    openrouter_api_key = str(request.data.get("openrouter_api_key") or "").strip()
     if not name:
         return Response({"error": "name is required."}, status=400)
 
     existing = repo.list_bots(company_id=company_id)
-    max_bots = _company_plan_max_bots(company_id)
-    if len(existing) >= max_bots:
+    if len(existing) >= 1:
         return Response(
-            {
-                "error": "Bot limit reached for current plan.",
-                "current_bots": len(existing),
-                "max_bots": max_bots,
-                "hint": "Upgrade company plan to add more bots.",
-            },
-            status=status.HTTP_402_PAYMENT_REQUIRED,
-        )
-
-    # First bot can be free. Additional bots should be explicitly paid.
-    if len(existing) >= 1 and requested_plan != "paid":
-        return Response(
-            {"error": "Additional bots require paid plan_type='paid'."},
-            status=status.HTTP_402_PAYMENT_REQUIRED,
+            {"error": "Only one bot is allowed per company."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
     bot = repo.create_bot(
         {
             "company_id": company_id,
             "name": name,
             "system_prompt": system_prompt,
-            "plan_type": requested_plan,
+            "openrouter_api_key": openrouter_api_key,
+            "plan_type": "free",
             "widget_key": f"bot_{secrets.token_urlsafe(24)}",
         }
     )
@@ -856,6 +2023,7 @@ def bots(request):
                 "company_id": bot.company_id,
                 "name": bot.name,
                 "system_prompt": bot.system_prompt,
+                "openrouter_api_key": bot.openrouter_api_key,
                 "plan_type": bot.plan_type,
                 "widget_key": bot.widget_key,
                 "created_at": bot.created_at,
@@ -884,6 +2052,7 @@ def bots(request):
         fields={
             "name": serializers.CharField(required=False),
             "system_prompt": serializers.CharField(required=False, allow_blank=True),
+            "openrouter_api_key": serializers.CharField(required=False, allow_blank=True),
         },
     ),
     responses={
@@ -907,6 +2076,7 @@ def bot_detail(request, bot_id: int):
                 "company_id": company_id,
                 "name": bot.name,
                 "system_prompt": bot.system_prompt,
+                "openrouter_api_key": bot.openrouter_api_key,
                 "plan_type": bot.plan_type,
                 "widget_key": bot.widget_key,
                 "created_at": bot.created_at,
@@ -921,6 +2091,8 @@ def bot_detail(request, bot_id: int):
         updates["name"] = name
     if "system_prompt" in request.data:
         updates["system_prompt"] = str(request.data.get("system_prompt") or "").strip()
+    if "openrouter_api_key" in request.data:
+        updates["openrouter_api_key"] = str(request.data.get("openrouter_api_key") or "").strip()
     if not updates:
         return Response({"error": "No updates provided."}, status=400)
     repo.update_bot(int(bot.id), updates)
@@ -933,6 +2105,7 @@ def bot_detail(request, bot_id: int):
                 "company_id": fresh.company_id,
                 "name": fresh.name,
                 "system_prompt": fresh.system_prompt,
+                "openrouter_api_key": fresh.openrouter_api_key,
                 "plan_type": fresh.plan_type,
                 "widget_key": fresh.widget_key,
                 "created_at": fresh.created_at,
@@ -1019,6 +2192,7 @@ def public_chat_query(request):
         company_id=int(bot.company_id),
         bot_id=int(bot.id),
         bot_system_prompt=str(bot.system_prompt or ""),
+        bot_openrouter_api_key=str(bot.openrouter_api_key or ""),
     )
     latency_ms = int((time.time() - t0) * 1000)
     citations = result.get("citations") or []
@@ -1216,6 +2390,12 @@ def upload_document(request):
     chunk_count = len(chunks)
     token_count = sum(token_counts)
     embedding_count = chunk_count
+    bot_openrouter_key = str(bot.openrouter_api_key or "").strip()
+    if not bot_openrouter_key:
+        return Response(
+            {"error": "OpenRouter API key is required for this bot. Save it in bot settings first."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     doc = repo.create_document(
         {
@@ -1232,7 +2412,11 @@ def upload_document(request):
     )
 
     try:
-        embeddings = get_embeddings(chunks, batch_size=embedding_batch_size)
+        embeddings = get_embeddings(
+            chunks,
+            batch_size=embedding_batch_size,
+            openrouter_api_key=bot_openrouter_key,
+        )
         if len(embeddings) != chunk_count:
             raise RuntimeError("Embeddings returned unexpected count.")
 
@@ -1241,7 +2425,7 @@ def upload_document(request):
             zip(chunks, embeddings, token_counts, chunk_meta)
         ):
             point_id = doc.id * 1_000_000 + i
-            section_title, page_num, chapter_name = meta
+            _section_title, _page_num, _chapter_name = meta
             payload: Dict[str, Any] = {
                 "doc_id": doc.id,
                 "company_id": company_id,
@@ -1250,8 +2434,6 @@ def upload_document(request):
                 "chunk_id": f"{doc.id}_{i}",
                 "text": chunk_text,
                 "token_count": tok_count,
-                "source_section": section_title or "",
-                "page_number": page_num,
             }
             points.append(
                 {
@@ -1293,8 +2475,8 @@ def upload_document(request):
                     "error": "Embedding API authentication failed (401).",
                     "details": msg,
                     "hint": (
-                        "Set a valid OPENROUTER_API_KEY in .env (OpenRouter: "
-                        "https://openrouter.ai/keys). Invalid, expired, or revoked keys "
+                        "Set a valid OpenRouter key in this bot's OpenRouter field "
+                        "(OpenRouter: https://openrouter.ai/keys). Invalid, expired, or revoked keys "
                         'return "User not found" from the provider.'
                     ),
                 },
@@ -1500,6 +2682,7 @@ def chat_query(request):
         company_id=company_id,
         bot_id=int(bot.id),
         bot_system_prompt=str(bot.system_prompt or ""),
+        bot_openrouter_api_key=str(bot.openrouter_api_key or ""),
     )
     latency_ms = int((time.time() - t0) * 1000)
 
@@ -1615,6 +2798,7 @@ def chat_query_stream(request):
         company_id=company_id,
         bot_id=int(bot.id),
         bot_system_prompt=str(bot.system_prompt or ""),
+        bot_openrouter_api_key=str(bot.openrouter_api_key or ""),
     )
     citations = result.get("citations") or []
     top_k_used = result.get("top_k")

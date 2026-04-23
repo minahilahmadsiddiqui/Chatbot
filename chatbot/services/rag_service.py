@@ -138,8 +138,6 @@ def _build_context(retrieved: List[Dict[str, Any]], *, max_context_tokens: int) 
                 "chunk_index": payload.get("chunk_index"),
                 "token_count": use_tok,
                 "score": r.get("score"),
-                "source_section": (payload.get("source_section") or "").strip(),
-                "page_number": payload.get("page_number"),
             }
         )
         running += use_tok
@@ -147,20 +145,12 @@ def _build_context(retrieved: List[Dict[str, Any]], *, max_context_tokens: int) 
 
 
 def _citation_entry(chunk: Dict[str, Any]) -> Dict[str, Any]:
-    page = chunk.get("page_number")
-    try:
-        page = int(page) if page is not None else None
-    except Exception:
-        page = None
-    sec = (chunk.get("source_section") or "").strip() or None
     return {
         "doc_id": chunk.get("doc_id"),
         "chunk_index": chunk.get("chunk_index"),
         "chunk_id": chunk.get("chunk_id"),
         "text_preview": _text_preview(chunk.get("text") or ""),
         "token_count": chunk.get("token_count"),
-        "source_section": sec,
-        "page": page,
     }
 
 
@@ -317,10 +307,10 @@ def _cross_encoder_relevance_diagnostics(
     return out
 
 
-def _openrouter_client_for_query_rewrite() -> OpenAI:
-    api_key = getattr(settings, "OPENROUTER_API_KEY", None)
+def _openrouter_client_for_query_rewrite(*, openrouter_api_key: str) -> OpenAI:
+    api_key = str(openrouter_api_key or "").strip()
     if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
+        raise RuntimeError("Missing bot OpenRouter API key")
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
     return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
@@ -442,6 +432,7 @@ def _rewrite_query_for_typos(
     query: str,
     *,
     qdrant: QdrantService,
+    openrouter_api_key: str,
     company_id: Optional[int] = None,
     bot_id: Optional[int] = None,
     doc_ids: Optional[Sequence[int]] = None,
@@ -453,7 +444,7 @@ def _rewrite_query_for_typos(
         return q, {"enabled": True, "applied": False}
     alias_seeded_query, alias_diag = _apply_alias_normalization(q)
     try:
-        client = _openrouter_client_for_query_rewrite()
+        client = _openrouter_client_for_query_rewrite(openrouter_api_key=openrouter_api_key)
         model = str(getattr(settings, "RAG_TYPO_CORRECTION_MODEL", "") or "").strip() or str(
             getattr(settings, "OPENROUTER_CHAT_MODEL", "google/gemini-2.5-flash")
         )
@@ -528,6 +519,7 @@ def _top_dense_score_for_query(
     qdrant: QdrantService,
     query_text: str,
     limit: int,
+    openrouter_api_key: str,
     company_id: Optional[int] = None,
     bot_id: Optional[int] = None,
     doc_ids: Optional[Sequence[int]] = None,
@@ -535,7 +527,7 @@ def _top_dense_score_for_query(
     """
     Lightweight relevance probe used to avoid risky typo rewrites.
     """
-    emb = get_embeddings([query_text])[0]
+    emb = get_embeddings([query_text], openrouter_api_key=openrouter_api_key)[0]
     raw = qdrant.search(
         emb,
         limit=max(1, int(limit)),
@@ -564,6 +556,7 @@ def run_rag_query(
     bot_id: Optional[int] = None,
     doc_ids: Optional[Sequence[int]] = None,
     bot_system_prompt: str = "",
+    bot_openrouter_api_key: str = "",
 ) -> Dict[str, Any]:
     del session_id
     top_k = int(top_k if top_k is not None else getattr(settings, "RAG_TOP_K", 5))
@@ -577,6 +570,22 @@ def run_rag_query(
         if max_context_tokens is not None
         else getattr(settings, "RAG_MAX_CONTEXT_TOKENS", 3200)
     )
+
+    bot_openrouter_api_key = str(bot_openrouter_api_key or "").strip()
+    if not bot_openrouter_api_key:
+        return {
+            "answer": UNKNOWN_POLICY_PHRASE,
+            "fallback_used": True,
+            "retrieved": [],
+            "citations": [],
+            "latency_ms": 0,
+            "top_k": top_k,
+            "threshold": threshold,
+            "retrieval_diagnostics": {"error": "Missing bot OpenRouter API key."},
+            "sentence_evidence": [],
+            "ab_variant": "control",
+            **_pipeline_fields(rag_retrieval_ran=False, pipeline="missing_bot_openrouter_key"),
+        }
 
     if _is_obvious_gibberish_query(query):
         return {
@@ -616,6 +625,7 @@ def run_rag_query(
         sanitized, typo_diag = _rewrite_query_for_typos(
             original_sanitized,
             qdrant=qdrant,
+            openrouter_api_key=bot_openrouter_api_key,
             company_id=company_id,
             bot_id=bot_id,
             doc_ids=doc_ids,
@@ -627,6 +637,7 @@ def run_rag_query(
                 qdrant=qdrant,
                 query_text=original_sanitized,
                 limit=probe_limit,
+                openrouter_api_key=bot_openrouter_api_key,
                 company_id=company_id,
                 bot_id=bot_id,
                 doc_ids=doc_ids,
@@ -635,6 +646,7 @@ def run_rag_query(
                 qdrant=qdrant,
                 query_text=sanitized,
                 limit=probe_limit,
+                openrouter_api_key=bot_openrouter_api_key,
                 company_id=company_id,
                 bot_id=bot_id,
                 doc_ids=doc_ids,
@@ -651,7 +663,10 @@ def run_rag_query(
                 typo_diag["original_top_dense"] = original_top
                 typo_diag["corrected_top_dense"] = corrected_top
                 typo_diag["min_required_delta"] = min_delta
-        query_embedding = get_embeddings([sanitized])[0]
+        query_embedding = get_embeddings(
+            [sanitized],
+            openrouter_api_key=bot_openrouter_api_key,
+        )[0]
         candidate_limit = max(top_k * 4, top_k)
         raw = qdrant.search(
             query_embedding,
@@ -718,8 +733,6 @@ def run_rag_query(
                         "chunk_index": (r.get("payload") or {}).get("chunk_index"),
                         "chunk_id": (r.get("payload") or {}).get("chunk_id"),
                         "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
-                        "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
-                        "page_number": (r.get("payload") or {}).get("page_number"),
                     }
                     for r in selected
                 ],
@@ -765,6 +778,7 @@ def run_rag_query(
                 temperature=float(getattr(settings, "OPENROUTER_TEMPERATURE", 0.3)),
                 prefer_answer_from_context=True,
                 custom_system_prompt=bot_system_prompt,
+                openrouter_api_key=bot_openrouter_api_key,
             ).strip()
         except Exception as e:
             llm_error = str(e)
@@ -789,8 +803,6 @@ def run_rag_query(
                     "chunk_index": (r.get("payload") or {}).get("chunk_index"),
                     "chunk_id": (r.get("payload") or {}).get("chunk_id"),
                     "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
-                    "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
-                    "page_number": (r.get("payload") or {}).get("page_number"),
                 }
                 for r in selected
             ],
@@ -814,7 +826,10 @@ def run_rag_query(
             and bool(result.get("fallback_used"))
             and sanitized.strip().lower() != original_sanitized.strip().lower()
         ):
-            retry_embedding = get_embeddings([original_sanitized])[0]
+            retry_embedding = get_embeddings(
+                [original_sanitized],
+                openrouter_api_key=bot_openrouter_api_key,
+            )[0]
             retry_raw = qdrant.search(
                 retry_embedding,
                 limit=candidate_limit,
@@ -842,8 +857,6 @@ def run_rag_query(
                             "chunk_index": (r.get("payload") or {}).get("chunk_index"),
                             "chunk_id": (r.get("payload") or {}).get("chunk_id"),
                             "text_preview": _text_preview((r.get("payload") or {}).get("text") or ""),
-                            "source_section": ((r.get("payload") or {}).get("source_section") or "").strip(),
-                            "page_number": (r.get("payload") or {}).get("page_number"),
                         }
                         for r in retry_selected
                     ]

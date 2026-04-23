@@ -17,13 +17,18 @@ from chatbot.views import (
     documents_ingest_alias,
     generate_widget_script,
     generate_widget_script_alias,
+    get_admin_company,
     get_all_documents,
     get_all_documents_alias,
     get_stats,
     get_stats_alias,
     logout,
+    public_widget_config,
+    public_widget_script,
     public_chat_query,
+    forgot_password,
     refresh_token,
+    reset_password,
     resend_verification_code,
     super_admin_companies,
     super_admin_company_detail,
@@ -42,6 +47,10 @@ urlpatterns = [
     path("auth/login/", admin_login),
     path("auth/verify-email/", verify_email),
     path("auth/resend-verification-code/", resend_verification_code),
+    path("auth/forgot-password/", forgot_password),
+    path("auth/forgot-password", forgot_password),
+    path("auth/reset-password/", reset_password),
+    path("auth/reset-password", reset_password),
     path("auth/refresh/", refresh_token),
     path("auth/logout/", logout),
 
@@ -54,6 +63,7 @@ urlpatterns = [
 
     # Company admin APIs
     path("admin/companies/", add_company),
+    path("admin/companies/current/", get_admin_company),
     path("admin/bots/", bots),
     path("admin/bots/<int:bot_id>/", bot_detail),
     path("admin/bots/<int:bot_id>/widget-script/", generate_widget_script),
@@ -64,6 +74,8 @@ urlpatterns = [
     path("admin/chat/query/stream/", chat_query_stream),
 
     # Public APIs
+    path("public/widget.js", public_widget_script),
+    path("public/widget/config/", public_widget_config),
     path("public/chat/query/", public_chat_query),
 
     # Backwards-compatible aliases (legacy paths)
@@ -76,6 +88,8 @@ urlpatterns = [
     path("documents/ingest/", documents_ingest_alias),
     path("chat/query/", chat_query_alias),
     path("chat/query/stream/", chat_query_stream_alias),
+    path("forgot-password/", forgot_password),
+    path("reset-password/", reset_password),
     path("upload/", upload_document_alias),
     path("delete/<int:doc_id>/", delete_document),
 ]

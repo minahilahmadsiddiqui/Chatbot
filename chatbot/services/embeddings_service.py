@@ -15,13 +15,18 @@ def _embedding_error_should_retry(exc: Exception, attempt: int, max_attempts: in
     return True
 
 
-def get_embeddings(texts: List[str], *, batch_size: int = 64) -> List[List[float]]:
+def get_embeddings(
+    texts: List[str],
+    *,
+    batch_size: int = 64,
+    openrouter_api_key: str = "",
+) -> List[List[float]]:
     """
     Compute embeddings with batching to avoid provider request size issues.
     """
-    api_key = getattr(settings, "OPENROUTER_API_KEY", None)
+    api_key = str(openrouter_api_key or "").strip()
     if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
+        raise RuntimeError("Missing bot OpenRouter API key")
 
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     embedding_model = getattr(settings, "OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")

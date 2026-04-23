@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 # Keep in sync with chatbot.services.gemini_service.UNKNOWN_POLICY_PHRASE
 UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
@@ -331,7 +331,7 @@ def format_plain_answer_with_metadata(
     *,
     append_source_metadata: bool = True,
 ) -> str:
-    """Plain text with optional Source / Page number / closing line (for JSON `answer` field)."""
+    """Plain text with optional closing line (for JSON `answer` field)."""
     body = (body or "").strip()
     if not body:
         return body
@@ -339,8 +339,7 @@ def format_plain_answer_with_metadata(
         return body
     if not append_source_metadata:
         return body
-    src, page = _primary_source_from_citations(citations)
-    return f"{body}\n\nSource: {src}\n\nPage number: {page}\n\n{CLOSING_LINE}"
+    return f"{body}\n\n{CLOSING_LINE}"
 
 
 def clean_answer_plain_for_client(
@@ -350,7 +349,7 @@ def clean_answer_plain_for_client(
     append_source_metadata: bool = True,
 ) -> str:
     """
-    Full plain-text answer for APIs: cleaned body + optional Source + Page number + closing line.
+    Full plain-text answer for APIs: cleaned body + optional closing line.
     """
     body = clean_answer_body_only(answer, citations)
     if not body or is_fallback_answer(body):
@@ -442,24 +441,6 @@ def _markdownish_to_html(body: str) -> str:
     return "\n".join(parts)
 
 
-def _primary_source_from_citations(citations: List[Dict[str, Any]]) -> Tuple[str, str]:
-    """(source_label, page_label) for display; uses first citation with any metadata."""
-    if not citations:
-        return "Unknown", "Unknown"
-    for c in citations:
-        sec = (c.get("source_section") or "").strip()
-        pg = c.get("page")
-        if sec or pg is not None:
-            src = sec if sec else "Unknown"
-            page_str = str(pg) if pg is not None else "Unknown"
-            return src, page_str
-    c0 = citations[0]
-    sec = (c0.get("source_section") or "").strip() or "Unknown"
-    pg = c0.get("page")
-    page_str = str(pg) if pg is not None else "Unknown"
-    return sec, page_str
-
-
 def build_chat_answer_html(
     *,
     answer: str,
@@ -470,7 +451,7 @@ def build_chat_answer_html(
     HTML for chat UI. Pass **body-only** text from `clean_answer_body_only` (not the full plain
     string that already includes Source / Page / closing line), so metadata is not duplicated.
 
-    Layout: answer paragraph(s) first, then optionally Source: / Page number: lines and closing.
+    Layout: answer paragraph(s) first, then optional closing line.
     """
     t = (answer or "").strip()
     if not t:
@@ -492,29 +473,9 @@ def build_chat_answer_html(
     if not append_source_metadata:
         return f'<div class="chat-answer">\n{inner}\n</div>'
 
-    src_label, page_label = _primary_source_from_citations(citations)
-
     meta = (
         '<div class="chat-source-meta">'
-        f'<p class="chat-source-line"><strong>Source:</strong> {html.escape(src_label)}</p>'
-        f'<p class="chat-source-line"><strong>Page number:</strong> {html.escape(page_label)}</p>'
         f'<p class="chat-answer-closing">{html.escape(CLOSING_LINE)}</p>'
         "</div>"
     )
-
-    extra = ""
-    if len(citations) > 1:
-        bits: List[str] = []
-        for c in citations[1:8]:
-            s = (c.get("source_section") or "").strip() or "—"
-            pg = c.get("page")
-            ps = str(pg) if pg is not None else "—"
-            bits.append(f"{html.escape(s)} (page {html.escape(ps)})")
-        if bits:
-            extra = (
-                '<p class="chat-additional-sources"><em>Also cited: '
-                + "; ".join(bits)
-                + "</em></p>"
-            )
-
-    return f'<div class="chat-answer">\n{inner}\n{meta}{extra}\n</div>'
+    return f'<div class="chat-answer">\n{inner}\n{meta}\n</div>'

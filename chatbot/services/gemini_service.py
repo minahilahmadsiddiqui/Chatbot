@@ -42,10 +42,10 @@ def append_raw_answer_before_ui_processing(text: str) -> None:
     return
 
 
-def _openrouter_client() -> OpenAI:
-    api_key = getattr(settings, "OPENROUTER_API_KEY", None)
+def _openrouter_client(*, api_key_override: Optional[str] = None) -> OpenAI:
+    api_key = (api_key_override or "").strip()
     if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
+        raise RuntimeError("Missing bot OpenRouter API key")
 
     base_url = getattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     timeout = float(getattr(settings, "OPENROUTER_HTTP_TIMEOUT_SEC", 120))
@@ -178,6 +178,7 @@ def generate_answer(
     temperature: float = 0.2,
     prefer_answer_from_context: bool = False,
     custom_system_prompt: Optional[str] = None,
+    openrouter_api_key: Optional[str] = None,
 ) -> str:
     """
     Calls OpenRouter Chat Completions API.
@@ -186,7 +187,7 @@ def generate_answer(
     when context is present.
     """
     ensure_raw_answer_log_dir()
-    client = _openrouter_client()
+    client = _openrouter_client(api_key_override=openrouter_api_key)
 
     # Keep the prompt tight and explicit; prefer grounded answers over fallback
     # when there is any relevant information in the context.
@@ -203,53 +204,8 @@ def generate_answer(
         ]
     )
 
-    concise = (
-        "Be concise: answer only what the question asks; omit unrelated policies, examples, "
-        "and background that does not directly address the question.\n"
-        "Prefer a tight summary over long quotations; include full detail only where the question requires it.\n"
-    )
-
-    if prefer_answer_from_context:
-        system_prompt = (
-            "You are an employee handbook assistant.\n"
-            + concise
-            + "The user question must be answered using ONLY the provided Context excerpts.\n"
-            "Follow this decision rule strictly:\n"
-            "Step 1) Determine whether the Context contains direct evidence for the exact question.\n"
-            "Direct evidence means the same policy topic and explicit matching facts (eligibility, limits, amounts, timelines, approvals, conditions, exceptions).\n"
-            "Do NOT treat generic HR text, nearby sections, or loosely related topics as evidence.\n"
-            "If evidence is missing, partial-but-not-on-topic, or ambiguous, respond with EXACTLY this sentence and nothing else:\n"
-            f"\"{UNKNOWN_POLICY_PHRASE}\"\n"
-            "Step 2) Only if direct evidence exists, answer using only those relevant lines/chunks.\n"
-            "Never infer, guess, generalize, or combine unrelated chunks to fabricate an answer.\n"
-            "Never use prior knowledge beyond the Context.\n"
-            "If any requested detail is not explicitly present in Context, omit that detail.\n"
-            "Prefer short, faithful paraphrase close to the original wording.\n"
-            "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
-        )
-    else:
-        system_prompt = (
-            "You are an employee handbook assistant.\n"
-            + concise
-            + "Answer ONLY from the provided handbook excerpts.\n"
-            "Use ONLY excerpts that match the question topic; ignore unrelated policies.\n"
-            "Do NOT stitch text from different policy topics.\n"
-            "Never invent or infer company policy.\n"
-            f"If the handbook does not explicitly mention the policy, respond with exactly: \"{UNKNOWN_POLICY_PHRASE}\".\n"
-            "Do not answer using loosely related policies.\n"
-            "Prefer exact section wording over paraphrased assumptions.\n"
-            "Quote or cite section titles when possible.\n"
-            "If you provide any specific detail, it must appear verbatim in the provided Context.\n"
-            "Every sentence must be grammatically complete: do not paste mid-sentence fragments.\n"
-        )
-    custom_prompt = (custom_system_prompt or "").strip()
-    if custom_prompt:
-        system_prompt += (
-            "\nAdditional bot instructions from the workspace admin:\n"
-            f"{custom_prompt}\n"
-            "These custom instructions must be followed only when they do not conflict "
-            "with the grounding and safety rules above."
-        )
+    del prefer_answer_from_context
+    system_prompt = (custom_system_prompt or "").strip()
     prompt = (
         "Context (authoritative):\n"
         f"{context_text}\n\n"

@@ -37,6 +37,8 @@ class AdminRecord:
     is_verified: bool
     verification_code: Optional[str]
     verification_expires_at: Optional[str]
+    password_reset_code: Optional[str]
+    password_reset_expires_at: Optional[str]
     created_at: str
 
 
@@ -56,9 +58,30 @@ class BotRecord:
     company_id: int
     name: str
     system_prompt: str
+    openrouter_api_key: str
     plan_type: str
     widget_key: str
     created_at: str
+
+
+@dataclass
+class PaymentRecord:
+    id: int
+    company_id: int
+    admin_id: int
+    bot_name: str
+    amount_pkr: int
+    amount_usd: float
+    currency: str
+    payment_method: str
+    card_type: Optional[str]
+    provider: str
+    provider_intent_id: str
+    status: str
+    metadata: Dict[str, Any]
+    created_at: str
+    updated_at: str
+    paid_at: Optional[str]
 
 
 class FirestoreRepository:
@@ -69,6 +92,7 @@ class FirestoreRepository:
         self.admins = self.db.collection("admins")
         self.companies = self.db.collection("companies")
         self.bots = self.db.collection("bots")
+        self.payments = self.db.collection("payments")
         self.auth_sessions = self.db.collection("auth_sessions")
         self.refresh_tokens = self.db.collection("refresh_tokens")
         self.counters = self.db.collection("_counters")
@@ -113,6 +137,8 @@ class FirestoreRepository:
             is_verified=bool(data.get("is_verified", False)),
             verification_code=data.get("verification_code"),
             verification_expires_at=data.get("verification_expires_at"),
+            password_reset_code=data.get("password_reset_code"),
+            password_reset_expires_at=data.get("password_reset_expires_at"),
             created_at=str(data.get("created_at", self._now_iso())),
         )
 
@@ -138,9 +164,33 @@ class FirestoreRepository:
             company_id=int(data.get("company_id", 0)),
             name=str(data.get("name", "")).strip(),
             system_prompt=str(data.get("system_prompt", "")),
+            openrouter_api_key=str(data.get("openrouter_api_key", "")),
             plan_type=str(data.get("plan_type", "free")).strip().lower() or "free",
             widget_key=str(data.get("widget_key", "")).strip(),
             created_at=str(data.get("created_at", self._now_iso())),
+        )
+
+    def _payment_from_snapshot(self, snap) -> Optional[PaymentRecord]:
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        return PaymentRecord(
+            id=int(data.get("id", 0)),
+            company_id=int(data.get("company_id", 0)),
+            admin_id=int(data.get("admin_id", 0)),
+            bot_name=str(data.get("bot_name", "")).strip(),
+            amount_pkr=int(data.get("amount_pkr", 0)),
+            amount_usd=float(data.get("amount_usd", 0.0)),
+            currency=str(data.get("currency", "PKR")).upper(),
+            payment_method=str(data.get("payment_method", "card")).strip().lower(),
+            card_type=(str(data.get("card_type", "")).strip().lower() or None),
+            provider=str(data.get("provider", "sandbox")).strip().lower(),
+            provider_intent_id=str(data.get("provider_intent_id", "")).strip(),
+            status=str(data.get("status", "pending")).strip().lower(),
+            metadata=dict(data.get("metadata") or {}),
+            created_at=str(data.get("created_at", self._now_iso())),
+            updated_at=str(data.get("updated_at", self._now_iso())),
+            paid_at=data.get("paid_at"),
         )
 
     def _next_id(self, counter_name: str) -> int:
@@ -293,6 +343,8 @@ class FirestoreRepository:
             "is_verified": bool(payload.get("is_verified", False)),
             "verification_code": payload.get("verification_code"),
             "verification_expires_at": payload.get("verification_expires_at"),
+            "password_reset_code": payload.get("password_reset_code"),
+            "password_reset_expires_at": payload.get("password_reset_expires_at"),
             "created_at": self._now_iso(),
         }
         self.admins.document(str(next_id)).set(data)
@@ -400,6 +452,7 @@ class FirestoreRepository:
             "company_id": int(payload.get("company_id")),
             "name": str(payload.get("name", "")).strip(),
             "system_prompt": str(payload.get("system_prompt", "")),
+            "openrouter_api_key": str(payload.get("openrouter_api_key", "")).strip(),
             "plan_type": str(payload.get("plan_type", "free")).strip().lower() or "free",
             "widget_key": str(payload.get("widget_key", "")).strip(),
             "created_at": self._now_iso(),
@@ -438,6 +491,50 @@ class FirestoreRepository:
         query = self.bots.where(filter=FieldFilter("widget_key", "==", key)).limit(1).stream()
         for snap in query:
             return self._bot_from_snapshot(snap)
+        return None
+
+    def create_payment(self, payload: Dict[str, Any]) -> PaymentRecord:
+        next_id = self._next_id("payments")
+        now = self._now_iso()
+        data = {
+            "id": next_id,
+            "company_id": int(payload.get("company_id")),
+            "admin_id": int(payload.get("admin_id")),
+            "bot_name": str(payload.get("bot_name", "")).strip(),
+            "amount_pkr": int(payload.get("amount_pkr", 0)),
+            "amount_usd": float(payload.get("amount_usd", 0.0)),
+            "currency": str(payload.get("currency", "PKR")).upper(),
+            "payment_method": str(payload.get("payment_method", "card")).strip().lower(),
+            "card_type": (str(payload.get("card_type", "")).strip().lower() or None),
+            "provider": str(payload.get("provider", "sandbox")).strip().lower(),
+            "provider_intent_id": str(payload.get("provider_intent_id", "")).strip(),
+            "status": str(payload.get("status", "pending")).strip().lower(),
+            "metadata": payload.get("metadata") or {},
+            "created_at": now,
+            "updated_at": now,
+            "paid_at": payload.get("paid_at"),
+        }
+        self.payments.document(str(next_id)).set(data)
+        return PaymentRecord(**data)
+
+    def get_payment(self, payment_id: int) -> Optional[PaymentRecord]:
+        snap = self.payments.document(str(payment_id)).get()
+        return self._payment_from_snapshot(snap)
+
+    def update_payment(self, payment_id: int, updates: Dict[str, Any]) -> None:
+        payload = dict(updates)
+        payload["updated_at"] = self._now_iso()
+        self.payments.document(str(payment_id)).set(payload, merge=True)
+
+    def find_payment_by_provider_intent_id(self, provider_intent_id: str) -> Optional[PaymentRecord]:
+        intent = str(provider_intent_id or "").strip()
+        if not intent:
+            return None
+        query = self.payments.where(
+            filter=FieldFilter("provider_intent_id", "==", intent)
+        ).limit(1).stream()
+        for snap in query:
+            return self._payment_from_snapshot(snap)
         return None
 
     def count_chat_messages(self) -> int:

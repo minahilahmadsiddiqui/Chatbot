@@ -250,6 +250,57 @@ EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "no-reply@example.com")
 
+# Payment gateway config
+PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "sandbox").strip().lower() or "sandbox"
+# Supported values include:
+# - sandbox: fully local mock flow
+# - stripe_fake: Stripe-like test flow without real Stripe credentials
+# - stripe/paypal/easypaisa/jazzcash/payfast/paypro/bank_transfer: provider-backed flows
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "pkr").strip().lower() or "pkr"
+
+# PayPal
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "").strip()
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "").strip()
+PAYPAL_BASE_URL = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com").strip()
+
+# Local/alternate gateways (set these per provider when integrating production accounts)
+EASYPAISA_BASE_URL = os.getenv("EASYPAISA_BASE_URL", "").strip()
+EASYPAISA_CREATE_PATH = os.getenv("EASYPAISA_CREATE_PATH", "/payments/create").strip()
+EASYPAISA_STATUS_PATH = os.getenv("EASYPAISA_STATUS_PATH", "/payments/{id}").strip()
+EASYPAISA_API_KEY = os.getenv("EASYPAISA_API_KEY", "").strip()
+EASYPAISA_API_SECRET = os.getenv("EASYPAISA_API_SECRET", "").strip()
+EASYPAISA_WEBHOOK_SECRET = os.getenv("EASYPAISA_WEBHOOK_SECRET", "").strip()
+
+JAZZCASH_BASE_URL = os.getenv("JAZZCASH_BASE_URL", "").strip()
+JAZZCASH_CREATE_PATH = os.getenv("JAZZCASH_CREATE_PATH", "/payments/create").strip()
+JAZZCASH_STATUS_PATH = os.getenv("JAZZCASH_STATUS_PATH", "/payments/{id}").strip()
+JAZZCASH_API_KEY = os.getenv("JAZZCASH_API_KEY", "").strip()
+JAZZCASH_API_SECRET = os.getenv("JAZZCASH_API_SECRET", "").strip()
+JAZZCASH_WEBHOOK_SECRET = os.getenv("JAZZCASH_WEBHOOK_SECRET", "").strip()
+
+PAYFAST_BASE_URL = os.getenv("PAYFAST_BASE_URL", "").strip()
+PAYFAST_CREATE_PATH = os.getenv("PAYFAST_CREATE_PATH", "/payments/create").strip()
+PAYFAST_STATUS_PATH = os.getenv("PAYFAST_STATUS_PATH", "/payments/{id}").strip()
+PAYFAST_API_KEY = os.getenv("PAYFAST_API_KEY", "").strip()
+PAYFAST_API_SECRET = os.getenv("PAYFAST_API_SECRET", "").strip()
+PAYFAST_WEBHOOK_SECRET = os.getenv("PAYFAST_WEBHOOK_SECRET", "").strip()
+
+PAYPRO_BASE_URL = os.getenv("PAYPRO_BASE_URL", "").strip()
+PAYPRO_CREATE_PATH = os.getenv("PAYPRO_CREATE_PATH", "/payments/create").strip()
+PAYPRO_STATUS_PATH = os.getenv("PAYPRO_STATUS_PATH", "/payments/{id}").strip()
+PAYPRO_API_KEY = os.getenv("PAYPRO_API_KEY", "").strip()
+PAYPRO_API_SECRET = os.getenv("PAYPRO_API_SECRET", "").strip()
+PAYPRO_WEBHOOK_SECRET = os.getenv("PAYPRO_WEBHOOK_SECRET", "").strip()
+
+BANK_TRANSFER_BASE_URL = os.getenv("BANK_TRANSFER_BASE_URL", "").strip()
+BANK_TRANSFER_CREATE_PATH = os.getenv("BANK_TRANSFER_CREATE_PATH", "/payments/create").strip()
+BANK_TRANSFER_STATUS_PATH = os.getenv("BANK_TRANSFER_STATUS_PATH", "/payments/{id}").strip()
+BANK_TRANSFER_API_KEY = os.getenv("BANK_TRANSFER_API_KEY", "").strip()
+BANK_TRANSFER_API_SECRET = os.getenv("BANK_TRANSFER_API_SECRET", "").strip()
+BANK_TRANSFER_WEBHOOK_SECRET = os.getenv("BANK_TRANSFER_WEBHOOK_SECRET", "").strip()
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
@@ -286,6 +337,11 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:8080",
     "http://localhost:8081",
     "http://127.0.0.1:8081",
+]
+
+# Allow file:// and sandboxed previews that send Origin: null during local widget testing.
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^null$",
 ]
 
 
