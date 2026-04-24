@@ -64,16 +64,41 @@ def _current_admin_and_company_id(request) -> Tuple[Optional[Any], Optional[int]
     admin = repo.get_admin(admin_id)
     if not admin:
         return None, None, Response({"error": "Admin not found."}, status=status.HTTP_404_NOT_FOUND)
-    if admin.company_id is None:
-        return (
-            admin,
-            None,
-            Response(
-                {"error": "Admin is not linked to a company. Create company first."},
-                status=status.HTTP_400_BAD_REQUEST,
-            ),
-        )
-    return admin, int(admin.company_id), None
+    if admin.company_id is not None:
+        return admin, int(admin.company_id), None
+
+    # Super-admin may operate in a scoped company context (e.g. login-as-company flow).
+    if str(getattr(request.user, "role", "")).strip().lower() == "super_admin":
+        company_raw = request.query_params.get("company_id")
+        if company_raw is None:
+            company_raw = request.data.get("company_id")
+        parsed_company_id = _parse_int(company_raw)
+        if parsed_company_id is None:
+            return (
+                admin,
+                None,
+                Response(
+                    {"error": "company_id is required for super admin context."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+            )
+        company = repo.get_company(int(parsed_company_id))
+        if not company:
+            return (
+                admin,
+                None,
+                Response({"error": "Company not found."}, status=status.HTTP_404_NOT_FOUND),
+            )
+        return admin, int(parsed_company_id), None
+
+    return (
+        admin,
+        None,
+        Response(
+            {"error": "Admin is not linked to a company. Create company first."},
+            status=status.HTTP_400_BAD_REQUEST,
+        ),
+    )
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -1272,6 +1297,7 @@ def _super_admin_company_row(company) -> Dict[str, Any]:
 def super_admin_dashboard_overview(request):
     companies = repo.list_companies()
     admins = repo.list_admins()
+    non_super_admins = [a for a in admins if str(getattr(a, "role", "")).strip().lower() != "super_admin"]
     bots = repo.list_all_bots()
     docs = repo.list_documents()
     total_queries = repo.count_chat_messages()
@@ -1281,7 +1307,7 @@ def super_admin_dashboard_overview(request):
         {
             "totals": {
                 "companies": len(companies),
-                "admins": len(admins),
+                "admins": len(non_super_admins),
                 "bots": len(bots),
                 "documents": len(docs),
                 "chat_queries": int(total_queries),
