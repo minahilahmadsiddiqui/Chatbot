@@ -9,7 +9,7 @@ from openai import OpenAI
 
 from chatbot.services.response_beautify_service import beautify_llm_response
 
-UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
+UNKNOWN_POLICY_PHRASE = "The document doesn't mention it."
 
 def _append_openrouter_initial_prompt(*, model: str, system_prompt: str, user_prompt: str) -> None:
     del model, system_prompt, user_prompt
@@ -172,7 +172,7 @@ def generate_answer(
     *,
     question: str,
     context_chunks: List[Dict[str, Any]],
-    fallback_phrase: str = "Contact the HR department",
+    fallback_phrase: str = "The document doesn't mention it.",
     model: str = "google/gemini-2.5-flash",
     max_output_tokens: int = 512,
     temperature: float = 0.2,
@@ -303,7 +303,7 @@ def generate_gemini_answer(
     *,
     question: str,
     context_chunks: List[Dict[str, Any]],
-    fallback_phrase: str = "Contact the HR department",
+    fallback_phrase: str = "The document doesn't mention it.",
     model: str = "google/gemini-2.5-flash",
     max_output_tokens: int = 512,
     temperature: float = 0.2,

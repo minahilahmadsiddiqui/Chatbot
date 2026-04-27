@@ -13,7 +13,7 @@ import re
 from typing import Any, Dict, List
 
 # Keep in sync with chatbot.services.gemini_service.UNKNOWN_POLICY_PHRASE
-UNKNOWN_POLICY_PHRASE = "The document doesn't mention it. Contact the HR"
+UNKNOWN_POLICY_PHRASE = "The document doesn't mention it."
 
 # Appended after source/page metadata on successful answers (plain + HTML).
 CLOSING_LINE = "If you have any further questions, do let me know."

@@ -18,7 +18,7 @@ from chatbot.services.text_splitter import count_tokens, truncate_text_to_token_
 
 FALLBACK_PHRASE = UNKNOWN_POLICY_PHRASE
 _HANDBOOK_ASSISTANT_GREETING = (
-    "Hello! I can help you find information in the employee handbook. What would you like to know?"
+    "Hello! I can help you find information in the uploaded document/documents. What would you like to know?"
 )
 def _append_rag_llm_input_log(
     *,
@@ -96,7 +96,7 @@ def _greeting_answer(query: str) -> str:
     if difflib.SequenceMatcher(None, qn, "how are you").ratio() >= 0.74:
         return "I'm good, looks like you meant \"How are you?\" How can I help you?"
     if re.search(r"\b(i['?]?m|i am)\s+(fine|good|well|okay|ok)\b", q):
-        return "Glad to hear it. What can I help you find in the employee handbook?"
+        return "Glad to hear it. What can I help you find in the uploaded document/documents?"
     return _HANDBOOK_ASSISTANT_GREETING
 
 
