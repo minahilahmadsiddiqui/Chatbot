@@ -1,8 +1,10 @@
 import hashlib
 import json
 import secrets
+import threading
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +57,9 @@ from chatbot.services.text_splitter import (
 from chatbot.auth.jwt_auth import JWTAuthentication, IsAdmin, IsSuperAdmin, generate_access_token, generate_refresh_token
 
 repo = FirestoreRepository()
+
+_SUPER_ADMIN_AGG_CACHE_LOCK = threading.Lock()
+_SUPER_ADMIN_AGG_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
 PAID_BOT_AMOUNT_PKR = 1680
 PAID_BOT_AMOUNT_USD = 6.0
 
@@ -799,6 +804,17 @@ def _send_verification_email(email: str, code: str) -> None:
         pass
 
 
+def _run_in_background(fn, /, *args, **kwargs) -> None:
+    def _runner() -> None:
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            # Background tasks should not crash request thread.
+            pass
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
 def _send_password_reset_email(email: str, code: str) -> None:
     subject = "ACME ONE Admin Password Reset Code"
     message = (
@@ -894,7 +910,7 @@ def admin_signup(request):
             "verification_expires_at": expires_at,
         }
     )
-    _send_verification_email(email, verification_code)
+    _run_in_background(_send_verification_email, email, verification_code)
     return Response(
         {
             "message": "Signup successful.",
@@ -1061,7 +1077,7 @@ def resend_verification_code(request):
             "verification_expires_at": expires_at,
         },
     )
-    _send_verification_email(email, verification_code)
+    _run_in_background(_send_verification_email, email, verification_code)
     return Response(
         {"message": "Verification code sent successfully."},
         status=status.HTTP_200_OK,
@@ -1096,7 +1112,7 @@ def forgot_password(request):
                 "password_reset_expires_at": expires_at,
             },
         )
-        _send_password_reset_email(email, reset_code)
+        _run_in_background(_send_password_reset_email, email, reset_code)
     return Response(
         {"message": "If this email is registered, a password reset code has been sent."},
         status=status.HTTP_200_OK,
@@ -1264,6 +1280,103 @@ def _super_admin_company_row(company) -> Dict[str, Any]:
     }
 
 
+def _compute_super_admin_aggregates() -> Dict[str, Any]:
+    """
+    Single-pass aggregation for super-admin dashboards to avoid per-company N+1 scans.
+    """
+    companies = repo.list_companies()
+    company_ids = {int(c.id) for c in companies}
+
+    admin_count_by_company: Dict[int, int] = defaultdict(int)
+    total_non_super_admins = 0
+    for snap in repo.admins.stream():
+        data = snap.to_dict() or {}
+        role = str(data.get("role", "")).strip().lower()
+        if role == "super_admin":
+            continue
+        total_non_super_admins += 1
+        cid = data.get("company_id")
+        try:
+            cid_int = int(cid)
+        except Exception:
+            continue
+        if cid_int in company_ids:
+            admin_count_by_company[cid_int] += 1
+
+    bot_count_by_company: Dict[int, int] = defaultdict(int)
+    bot_company_map: Dict[int, int] = {}
+    total_bots = 0
+    for b in repo.list_all_bots():
+        total_bots += 1
+        cid = int(b.company_id)
+        if cid in company_ids:
+            bot_count_by_company[cid] += 1
+        bot_company_map[int(b.id)] = cid
+
+    doc_count_by_company: Dict[int, int] = defaultdict(int)
+    total_docs = 0
+    for snap in repo.documents.stream():
+        total_docs += 1
+        data = snap.to_dict() or {}
+        cid = data.get("company_id")
+        try:
+            cid_int = int(cid)
+        except Exception:
+            continue
+        if cid_int in company_ids:
+            doc_count_by_company[cid_int] += 1
+
+    query_count_by_company: Dict[int, int] = defaultdict(int)
+    total_queries = 0
+    total_fallback = 0
+    for snap in repo.chat_messages.stream():
+        total_queries += 1
+        data = snap.to_dict() or {}
+        if bool(data.get("fallback_used")):
+            total_fallback += 1
+        bot_id = data.get("bot_id")
+        try:
+            bot_id_int = int(bot_id)
+        except Exception:
+            continue
+        cid_int = bot_company_map.get(bot_id_int)
+        if cid_int in company_ids:
+            query_count_by_company[cid_int] += 1
+
+    fallback_rate = (float(total_fallback) / float(total_queries)) if total_queries > 0 else 0.0
+    return {
+        "companies": companies,
+        "overview_totals": {
+            "companies": len(companies),
+            "admins": int(total_non_super_admins),
+            "bots": int(total_bots),
+            "documents": int(total_docs),
+            "chat_queries": int(total_queries),
+            "fallback_queries": int(total_fallback),
+            "fallback_rate": round(fallback_rate, 4),
+        },
+        "admin_count_by_company": dict(admin_count_by_company),
+        "bot_count_by_company": dict(bot_count_by_company),
+        "document_count_by_company": dict(doc_count_by_company),
+        "query_count_by_company": dict(query_count_by_company),
+    }
+
+
+def _get_super_admin_aggregates_cached(*, force_refresh: bool = False) -> Dict[str, Any]:
+    ttl_seconds = int(getattr(settings, "SUPER_ADMIN_DASHBOARD_CACHE_TTL_SECONDS", 20))
+    now = time.time()
+    with _SUPER_ADMIN_AGG_CACHE_LOCK:
+        cached = _SUPER_ADMIN_AGG_CACHE.get("data")
+        ts = float(_SUPER_ADMIN_AGG_CACHE.get("ts") or 0.0)
+        if (not force_refresh) and cached is not None and (now - ts) < ttl_seconds:
+            return cached
+    fresh = _compute_super_admin_aggregates()
+    with _SUPER_ADMIN_AGG_CACHE_LOCK:
+        _SUPER_ADMIN_AGG_CACHE["data"] = fresh
+        _SUPER_ADMIN_AGG_CACHE["ts"] = now
+    return fresh
+
+
 @extend_schema(
     operation_id="super_admin_overview",
     summary="Super-admin dashboard overview",
@@ -1295,27 +1408,9 @@ def _super_admin_company_row(company) -> Dict[str, Any]:
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsSuperAdmin])
 def super_admin_dashboard_overview(request):
-    companies = repo.list_companies()
-    admins = repo.list_admins()
-    non_super_admins = [a for a in admins if str(getattr(a, "role", "")).strip().lower() != "super_admin"]
-    bots = repo.list_all_bots()
-    docs = repo.list_documents()
-    total_queries = repo.count_chat_messages()
-    total_fallback = repo.count_fallback_chat_messages()
-    fallback_rate = (float(total_fallback) / float(total_queries)) if total_queries > 0 else 0.0
-    return Response(
-        {
-            "totals": {
-                "companies": len(companies),
-                "admins": len(non_super_admins),
-                "bots": len(bots),
-                "documents": len(docs),
-                "chat_queries": int(total_queries),
-                "fallback_queries": int(total_fallback),
-                "fallback_rate": round(fallback_rate, 4),
-            }
-        }
-    )
+    force_refresh = str(request.query_params.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    agg = _get_super_admin_aggregates_cached(force_refresh=force_refresh)
+    return Response({"totals": agg["overview_totals"]})
 
 
 @extend_schema(
@@ -1352,8 +1447,28 @@ def super_admin_dashboard_overview(request):
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsSuperAdmin])
 def super_admin_companies(request):
-    rows = [_super_admin_company_row(c) for c in repo.list_companies()]
-    return Response({"companies": rows})
+    force_refresh = str(request.query_params.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    agg = _get_super_admin_aggregates_cached(force_refresh=force_refresh)
+    rows = []
+    admin_counts = agg["admin_count_by_company"]
+    bot_counts = agg["bot_count_by_company"]
+    doc_counts = agg["document_count_by_company"]
+    query_counts = agg["query_count_by_company"]
+    for c in agg["companies"]:
+        cid = int(c.id)
+        rows.append(
+            {
+                "company_id": cid,
+                "name": c.name,
+                "plan_type": c.plan_type,
+                "admin_count": int(admin_counts.get(cid, 0)),
+                "bot_count": int(bot_counts.get(cid, 0)),
+                "document_count": int(doc_counts.get(cid, 0)),
+                "query_count": int(query_counts.get(cid, 0)),
+                "created_at": c.created_at,
+            }
+        )
+    return Response({"companies": rows, "totals": agg["overview_totals"]})
 
 
 @extend_schema(
@@ -2730,7 +2845,8 @@ def chat_query(request):
         ans_body, citations, append_source_metadata=append_meta
     )
 
-    repo.create_chat_message(
+    _run_in_background(
+        repo.create_chat_message,
         {
             "session_id": str(session_id),
             "bot_id": int(bot.id),
@@ -2740,9 +2856,10 @@ def chat_query(request):
             "response_text": ans,
             "latency_ms": latency_ms,
             "fallback_used": bool(result.get("fallback_used")),
-        }
+        },
     )
-    append_rag_telemetry(
+    _run_in_background(
+        append_rag_telemetry,
         {
             "session_id": str(session_id),
             "query": str(query),
@@ -2751,7 +2868,7 @@ def chat_query(request):
             "fallback_used": bool(result.get("fallback_used")),
             "latency_ms": latency_ms,
             "retrieval_diagnostics": result.get("retrieval_diagnostics") or {},
-        }
+        },
     )
 
     return Response(

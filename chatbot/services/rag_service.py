@@ -397,7 +397,7 @@ def _build_handbook_vocab(
 
 
 def _apply_vocab_fuzzy_normalization(query: str, *, vocab: set[str]) -> tuple[str, Dict[str, Any]]:
-    if not bool(getattr(settings, "RAG_TYPO_VOCAB_FUZZY_ENABLED", True)):
+    if not bool(getattr(settings, "RAG_TYPO_VOCAB_FUZZY_ENABLED", False)):
         return query, {"enabled": False, "applied": False, "changes": []}
     if not vocab:
         return query, {"enabled": True, "applied": False, "changes": [], "reason": "empty_vocab"}
@@ -438,7 +438,8 @@ def _rewrite_query_for_typos(
     doc_ids: Optional[Sequence[int]] = None,
 ) -> tuple[str, Dict[str, Any]]:
     q = _sanitize_query(query)
-    if not bool(getattr(settings, "RAG_TYPO_CORRECTION_ENABLED", True)):
+    # Default OFF for latency; enable explicitly when typo-rewrite quality is needed.
+    if not bool(getattr(settings, "RAG_TYPO_CORRECTION_ENABLED", False)):
         return q, {"enabled": False, "applied": False}
     if not q:
         return q, {"enabled": True, "applied": False}
@@ -667,7 +668,8 @@ def run_rag_query(
             [sanitized],
             openrouter_api_key=bot_openrouter_api_key,
         )[0]
-        candidate_limit = max(top_k * 4, top_k)
+        candidate_multiplier = max(1, int(getattr(settings, "RAG_CANDIDATE_MULTIPLIER", 2)))
+        candidate_limit = max(top_k * candidate_multiplier, top_k)
         raw = qdrant.search(
             query_embedding,
             limit=candidate_limit,
@@ -755,13 +757,6 @@ def run_rag_query(
                 **_pipeline_fields(rag_retrieval_ran=True, pipeline="dense_rag_abstain_relevance"),
             }
 
-        extractive_answer, _extractive_used = _extractive_answer_with_sources_from_context(
-            sanitized,
-            context_chunks,
-            max_sentences=int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 5)),
-            query_embedding=query_embedding,
-        )
-
         llm_error: Optional[str] = None
         try:
             _append_rag_llm_input_log(
@@ -782,6 +777,12 @@ def run_rag_query(
             ).strip()
         except Exception as e:
             llm_error = str(e)
+            extractive_answer, _extractive_used = _extractive_answer_with_sources_from_context(
+                sanitized,
+                context_chunks,
+                max_sentences=int(getattr(settings, "RAG_STRICT_MAX_SENTENCES", 5)),
+                query_embedding=query_embedding,
+            )
             answer = (extractive_answer or "").strip()
         if not answer:
             answer = UNKNOWN_POLICY_PHRASE
